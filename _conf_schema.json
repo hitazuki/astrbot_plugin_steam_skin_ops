@@ -1,0 +1,52 @@
+{
+  "enabled": {
+    "description": "启用后台监控",
+    "type": "bool",
+    "default": true
+  },
+  "interval_seconds": {
+    "description": "行情轮询间隔（秒）",
+    "type": "int",
+    "default": 1800
+  },
+  "quote_cache_seconds": {
+    "description": "即时报价缓存时间（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "max_items": {
+    "description": "最多监控饰品数量",
+    "type": "int",
+    "default": 20
+  },
+  "max_workers": {
+    "description": "单轮行情采集并发数（1-8）",
+    "type": "int",
+    "default": 2
+  },
+  "breakthrough_step_percent": {
+    "description": "规则继续向有利方向突破多少百分比后再次通知",
+    "type": "float",
+    "default": 3.0
+  },
+  "daily_summary_time": {
+    "description": "每日汇总时间（北京时间 HH:MM）",
+    "type": "string",
+    "default": "09:00"
+  },
+  "smis_timeout_seconds": {
+    "description": "SMIS 请求超时（秒）",
+    "type": "float",
+    "default": 15.0
+  },
+  "smis_max_retries": {
+    "description": "SMIS 临时错误最大尝试次数",
+    "type": "int",
+    "default": 3
+  },
+  "smis_min_request_interval_seconds": {
+    "description": "所有线程共享的 SMIS 最小请求间隔（秒）",
+    "type": "float",
+    "default": 1.0
+  }
+}
