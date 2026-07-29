@@ -73,6 +73,7 @@ class MonitoringManager:
         self._item_locks: dict[int, threading.Lock] = {}
         self._dispatch_lock = threading.Lock()
         self._sync_t7_rule_basis()
+        self._sync_breakthrough_behavior()
         self._sync_breakthrough_step()
 
     def _sync_t7_rule_basis(self) -> None:
@@ -83,11 +84,16 @@ class MonitoringManager:
         self.storage.reset_rule_states("t7")
         self.storage.set_metadata(key, value)
 
-    def _sync_breakthrough_step(self) -> None:
-        key = "alerting:breakthrough_step"
-        value = f"{self.breakthrough_step:.12g}"
+    def _sync_breakthrough_behavior(self) -> None:
+        key = "alerting:breakthrough_behavior"
+        value = "reentry:v1"
         if self.storage.get_metadata(key) == value:
             return
+        self._recalculate_active_breakthrough_levels()
+        self.storage.set_metadata(key, value)
+
+    def _recalculate_active_breakthrough_levels(self) -> None:
+        """Store the current active level in the legacy highest-level column."""
         for rule in self.storage.list_rules():
             state = self.storage.get_rule_state(int(rule["id"]))
             current = state.get("last_value")
@@ -100,6 +106,13 @@ class MonitoringManager:
             self.storage.update_rule_state(
                 int(rule["id"]), highest_notified_level=level
             )
+
+    def _sync_breakthrough_step(self) -> None:
+        key = "alerting:breakthrough_step"
+        value = f"{self.breakthrough_step:.12g}"
+        if self.storage.get_metadata(key) == value:
+            return
+        self._recalculate_active_breakthrough_levels()
         self.storage.set_metadata(key, value)
 
     def _lock_for(self, smis_id: int) -> threading.Lock:
@@ -552,9 +565,10 @@ class MonitoringManager:
                     "alert_active": 0, "clearing_count": 0,
                     "highest_notified_level": 0,
                 })
-            elif qualifies:
+            else:
                 level, depth = self._breakthrough_level(rule_type, limit, value)
-                if level > int(state["highest_notified_level"]):
+                previous_level = int(state["highest_notified_level"])
+                if qualifies and level > previous_level:
                     title, content = self._format_breakthrough_alert(
                         snapshot, stats, forecast, risk, rule, value, depth, level
                     )
@@ -563,10 +577,10 @@ class MonitoringManager:
                         str(rule["recipient_key"]), "rule_breakthrough", title, content,
                         driver=self.delivery_driver, rule_id=rule_id,
                     )
-                    changes.update({
-                        "highest_notified_level": level,
-                        "last_signal_at": observed,
-                    })
+                    changes["last_signal_at"] = observed
+                # This legacy field now tracks the current level, allowing a
+                # later upward re-entry into a previously reached level to alert.
+                changes["highest_notified_level"] = level if qualifies else 0
         self.storage.update_rule_state(rule_id, **changes)
 
     def _breakthrough_level(

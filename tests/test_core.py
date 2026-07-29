@@ -445,6 +445,23 @@ alerts:
         self.assertIn("https://steamcommunity.com/market/listings/730/", breakthrough)
         self.assertEqual(self.storage.get_rule_state(rule["id"])["highest_notified_level"], 1)
 
+    def test_breakthrough_alerts_again_after_level_retreat_and_reentry(self):
+        notifier = FakeNotifier()
+        manager = self.manager([0.72, 0.66, 0.69, 0.66], notifier)
+        rule = self.storage.add_rule(1579, "umo:a", "ratio", 72)
+
+        for _ in range(4):
+            manager.run_cycle(max_workers=1)
+
+        titles = [message[1] for message in notifier.messages]
+        self.assertEqual(len(titles), 3)
+        self.assertNotIn("第", titles[0])
+        self.assertIn("第 2 档", titles[1])
+        self.assertIn("第 2 档", titles[2])
+        self.assertEqual(
+            self.storage.get_rule_state(rule["id"])["highest_notified_level"], 2
+        )
+
     def test_breakthrough_level_includes_exact_three_percent_boundary(self):
         manager = self.manager()
         self.assertEqual(manager._breakthrough_level("ratio", 0.72, 0.6984)[0], 1)

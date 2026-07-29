@@ -40,7 +40,7 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 | `quote_cache_seconds` | `60` | 即时报价缓存时间 |
 | `max_items` | `20` | 全插件最多监控饰品数 |
 | `max_workers` | `2` | 单轮采集并发，范围 1-8 |
-| `breakthrough_step_percent` | `3` | 继续向有利方向变化后的再次通知档位 |
+| `breakthrough_step_percent` | `3` | 向有利方向每次进入新档位时通知；回落后重新进入同一档也会再次通知 |
 | `daily_summary_time` | `09:00` | 北京时间每日汇总时间 |
 | `smis_timeout_seconds` | `15` | 上游请求超时 |
 | `smis_max_retries` | `3` | 临时错误最大尝试次数 |
