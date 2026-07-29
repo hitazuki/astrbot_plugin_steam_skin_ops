@@ -16,7 +16,7 @@ def validate_rule(rule_type: str, threshold: float) -> tuple[str, str] | None:
 
 
 def rule_value(
-    snapshot: MarketSnapshot, stats: dict, rule_type: str,
+    snapshot: MarketSnapshot, forecast: dict, rule_type: str,
 ) -> tuple[float | None, float | None, str]:
     lowest = snapshot.lowest_platform
     if rule_type == "steam":
@@ -29,7 +29,9 @@ def rule_value(
         return platform_price, None, "ready"
     if rule_type == "ratio":
         return snapshot.calculated_ratio, snapshot.steam_net, "ready"
-    if not stats["t7_sufficient"] or not stats["t7_steam_net_p25"]:
-        return None, stats.get("t7_steam_net_p25"), "历史不足"
-    baseline = float(stats["t7_steam_net_p25"])
-    return platform_price / baseline, baseline, "ready"
+    predicted = forecast.get("predicted_steam_net")
+    ratio = forecast.get("forecast_balance_ratio")
+    if forecast.get("status") != "ready" or predicted is None or ratio is None:
+        reason = (forecast.get("reasons") or ["历史或当前行情不足"])[0]
+        return None, predicted, f"七日预测不可用：{reason}"
+    return float(ratio), float(predicted), "ready"

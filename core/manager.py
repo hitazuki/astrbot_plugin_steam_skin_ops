@@ -72,7 +72,16 @@ class MonitoringManager:
         self._locks_guard = threading.Lock()
         self._item_locks: dict[int, threading.Lock] = {}
         self._dispatch_lock = threading.Lock()
+        self._sync_t7_rule_basis()
         self._sync_breakthrough_step()
+
+    def _sync_t7_rule_basis(self) -> None:
+        key = "alerting:t7_basis"
+        value = "seven_day_dynamic_forecast:v1"
+        if self.storage.get_metadata(key) == value:
+            return
+        self.storage.reset_rule_states("t7")
+        self.storage.set_metadata(key, value)
 
     def _sync_breakthrough_step(self) -> None:
         key = "alerting:breakthrough_step"
@@ -494,7 +503,7 @@ class MonitoringManager:
         rule_type = str(rule["rule_type"])
         threshold = float(rule["threshold"])
         state = self.storage.get_rule_state(rule_id)
-        value, baseline, status = rule_value(snapshot, stats, rule_type)
+        value, baseline, status = rule_value(snapshot, forecast, rule_type)
         observed = snapshot.observed_at.isoformat()
         changes = {
             "last_value": value, "last_baseline": baseline,
@@ -579,7 +588,7 @@ class MonitoringManager:
     ) -> tuple[str, str]:
         rule_type = str(rule["rule_type"])
         labels = {
-            "ratio": "即时比例", "t7": "七日历史 P25 比例",
+            "ratio": "即时比例", "t7": "七日预测比例",
             "platform": "最低平台价", "steam": "Steam 售价",
         }
         value_text = f"{value:.2%}" if rule_type in {"ratio", "t7"} else f"¥{value:.2f}"
@@ -618,7 +627,7 @@ class MonitoringManager:
 
         queued = 0
         labels = {
-            "ratio": "即时比例", "t7": "T+7 比例",
+            "ratio": "即时比例", "t7": "T+7 预测比例",
             "platform": "平台价", "steam": "Steam 价",
         }
         analysis_cache: dict[str, tuple[dict, dict]] = {}
@@ -848,7 +857,7 @@ class MonitoringManager:
     ) -> tuple[str, str]:
         labels = {
             "ratio": ("【即时挂刀】", "即时比例"),
-            "t7": ("【T+7挂刀】", "七日历史 P25 比例"),
+            "t7": ("【T+7预测挂刀】", "七日预测比例"),
             "platform": ("【平台到价】", "最低平台价"),
             "steam": ("【Steam清仓】", "Steam 售价"),
         }

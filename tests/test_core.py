@@ -70,6 +70,17 @@ class FakeSource:
         return result
 
 
+class ForecastHistorySource(FakeSource):
+    def fetch_history(self, item, days):
+        self.history_calls += 1
+        self.history_days.append(days)
+        result = []
+        for index in range(1, 30 * 12 + 1):
+            history = snapshot(0.74, -(index * 2 * 3600))
+            result.append(MarketSnapshot(**{**history.__dict__, "kind": "history"}))
+        return result
+
+
 class StaleSource(FakeSource):
     def fetch_current(self, item):
         value = super().fetch_current(item)
@@ -223,6 +234,29 @@ class ServiceTestCase(unittest.TestCase):
         )
         self.assertEqual(
             migrated.get_rule_state(rule["id"])["highest_notified_level"], 6
+        )
+
+    def test_t7_forecast_basis_upgrade_resets_only_t7_rule_state(self):
+        t7_rule = self.storage.add_rule(1579, "umo:a", "t7", 72)
+        ratio_rule = self.storage.add_rule(1579, "umo:a", "ratio", 72)
+        self.storage.update_rule_state(
+            t7_rule["id"], alert_active=1, last_value=0.70, status="active"
+        )
+        self.storage.update_rule_state(
+            ratio_rule["id"], alert_active=1, last_value=0.70, status="active"
+        )
+
+        MonitoringManager(self.storage, FakeSource(), FakeNotifier())
+
+        self.assertEqual(
+            self.storage.get_metadata("alerting:t7_basis"),
+            "seven_day_dynamic_forecast:v1",
+        )
+        self.assertEqual(
+            self.storage.get_rule_state(t7_rule["id"])["alert_active"], 0
+        )
+        self.assertEqual(
+            self.storage.get_rule_state(ratio_rule["id"])["alert_active"], 1
         )
 
     @unittest.skip("独立服务 YAML 配置不属于纯插件")
@@ -604,16 +638,39 @@ alerts:
         self.assertEqual(value.lowest_platform, ("C5", 3.10, 0))
         self.assertEqual(value.calculated_ratio, round(3.10 / value.steam_net, 4))
 
-    def test_t7_rule_uses_seven_day_steam_net_p25(self):
+    def test_t7_rule_uses_displayed_dynamic_forecast_ratio(self):
         notifier = FakeNotifier()
-        manager = self.manager([0.70, 0.70], notifier)
+        manager = MonitoringManager(
+            self.storage, ForecastHistorySource([0.70]), notifier
+        )
         rule = manager.add_rule("umo:a", 1579, "t7", 72)
         manager.run_cycle(max_workers=1)
-        manager.run_cycle(max_workers=1)
         state = self.storage.get_rule_state(rule["id"])
+        quote = manager.quote("1579")
+
+        self.assertEqual(quote["forecast"]["status"], "ready")
+        self.assertEqual(
+            state["last_value"], quote["forecast"]["forecast_balance_ratio"]
+        )
+        self.assertEqual(
+            state["last_baseline"], quote["forecast"]["predicted_steam_net"]
+        )
         self.assertEqual(state["alert_active"], 1)
         self.assertEqual(len(notifier.messages), 1)
-        self.assertIn("T+7挂刀", notifier.messages[0][1])
+        self.assertIn("T+7预测挂刀", notifier.messages[0][1])
+        self.assertIn("七日预测比例", notifier.messages[0][2])
+
+    def test_t7_rule_waits_when_dynamic_forecast_is_unavailable(self):
+        notifier = FakeNotifier()
+        manager = self.manager([0.70], notifier)
+        rule = manager.add_rule("umo:a", 1579, "t7", 72)
+
+        manager.run_cycle(max_workers=1)
+
+        state = self.storage.get_rule_state(rule["id"])
+        self.assertIsNone(state["last_value"])
+        self.assertIn("七日预测不可用", state["status"])
+        self.assertEqual(notifier.messages, [])
 
     def test_platform_and_steam_rules_trigger_without_volume(self):
         notifier = FakeNotifier()

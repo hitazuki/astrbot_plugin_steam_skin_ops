@@ -57,11 +57,11 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 ## 数据口径与风险提示
 
 - `ratio`：最低第三方平台价 ÷ 当前 Steam 预计到手价。
-- `t7`：最低第三方平台价 ÷ 过去七日 Steam 预计到手价 P25。
+- `t7`：最低第三方平台价 ÷ 动态模型预测的七天后 Steam 预计到手价；触发比例与行情查询展示的“预测倒余额比例”一致。
 - `platform`：最低第三方平台价达到买入目标。
 - `steam`：Steam 展示售价达到库存清理目标。
 
-七日预测和价格、波动、库存、成交量风险评估仅供参考，不参与四类规则的基础阈值判断。第三方行情可能延迟、缺失或发生口径变化；本插件不构成投资建议，使用者应独立判断交易风险。
+七日预测会根据数据覆盖、回测误差和趋势诊断动态选择持平、近期水平、稳健线性或稳健对数模型，并用于 `t7` 规则；价格、波动、库存、成交量风险评估仅供参考，不参与四类规则的基础阈值判断。第三方行情可能延迟、缺失或发生口径变化；本插件不构成投资建议，使用者应独立判断交易风险。
 
 ## 开发
 
@@ -69,6 +69,13 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 python -m pip install -e ".[dev]"
 python -m unittest discover -s tests -v
 ruff check .
+python -m compileall -q main.py core
+python scripts/validate_market_package.py
 ```
+
+提交信息和 PR 标题使用带 scope 的 Conventional Commits，例如
+`feat(rules): use dynamic forecast for t7 alerts`。新克隆可执行
+`git config core.hooksPath .githooks` 启用本地提交校验；完整开发与发布约定见
+[`AGENTS.md`](AGENTS.md)。
 
 MIT License。行情与风险核心重构自 [steam-skin-ops](https://github.com/hitazuki/steam-skin-ops)。

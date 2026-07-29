@@ -335,7 +335,7 @@ class SteamSkinOpsPlugin(Star):
             if not rows:
                 yield event.plain_result("当前会话尚未配置规则。")
                 return
-            labels = {"ratio": "即时比例", "t7": "T+7比例", "platform": "平台买入价", "steam": "Steam清仓价"}
+            labels = {"ratio": "即时比例", "t7": "T+7预测比例", "platform": "平台买入价", "steam": "Steam清仓价"}
             lines = ["当前会话规则："]
             for row in rows:
                 active = "告警中" if row["state"].get("alert_active") else "监控中"

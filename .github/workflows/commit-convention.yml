@@ -1,0 +1,28 @@
+name: Commit convention
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate pull request title
+        env:
+          COMMIT_SUBJECT: ${{ github.event.pull_request.title }}
+        run: python scripts/check_commit_message.py --env COMMIT_SUBJECT
+
+      - name: Validate pull request commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python scripts/check_commit_message.py --range "$BASE_SHA..$HEAD_SHA"

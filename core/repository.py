@@ -547,6 +547,24 @@ class MonitorStorage:
             ))
         return self.get_rule_state(rule_id)
 
+    def reset_rule_states(self, rule_type: str) -> int:
+        """Reset evaluation state and cancel pending alerts for one rule type."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id,recipient_key FROM rules WHERE rule_type=?", (rule_type,)
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "DELETE FROM delivery_jobs WHERE status='pending' AND event_id IN "
+                    "(SELECT id FROM alert_events WHERE recipient_key=? "
+                    "AND signal_key LIKE ?)",
+                    (str(row["recipient_key"]), f"rule:{int(row['id'])}:%"),
+                )
+                conn.execute(
+                    "DELETE FROM rule_states WHERE rule_id=?", (int(row["id"]),)
+                )
+        return len(rows)
+
     def get_health_state(self, smis_id: int, recipient_key: str) -> dict[str, Any]:
         with self.connect() as conn:
             row = conn.execute(
