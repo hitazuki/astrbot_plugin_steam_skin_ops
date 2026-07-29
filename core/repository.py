@@ -1,28 +1,21 @@
 from __future__ import annotations
 
+import math
+import shutil
 import sqlite3
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .market import MarketSnapshot
+from .market import MAX_SOURCE_FUTURE_SKEW_SECONDS, MarketSnapshot
+from .rules import MAX_RULE_STATE_INTEGER, parse_rule_state_integer
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 DEFAULT_BREAKTHROUGH_STEP = 0.03
 
-
-DEFAULT_STATE = {
-    "alert_active": 0,
-    "qualifying_count": 0,
-    "clearing_count": 0,
-    "fetch_failures": 0,
-    "health_alerted": 0,
-    "last_ratio": None,
-    "last_signal_at": None,
-    "pending_signal_key": None,
-}
 
 DEFAULT_RULE_STATE = {
     "alert_active": 0,
@@ -39,19 +32,83 @@ DEFAULT_RULE_STATE = {
 DEFAULT_HEALTH_STATE = {"fetch_failures": 0, "health_alerted": 0}
 
 
+class RuleItemLimitError(RuntimeError):
+    pass
+
+
 class MonitorStorage:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        current_version = self._preflight_schema_version() if self.path.exists() else 0
+        if current_version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema v{current_version} is newer than supported "
+                f"v{SCHEMA_VERSION}"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        self._initialize(current_version)
+
+    def _preflight_schema_version(self) -> int:
+        """Read an existing database version without allowing SQLite to write it."""
+        main_version = self._read_schema_version(self.path, immutable=True)
+        if main_version > SCHEMA_VERSION:
+            return main_version
+
+        wal_path = Path(f"{self.path}-wal")
+        for _ in range(3):
+            try:
+                if wal_path.stat().st_size == 0:
+                    return main_version
+                before = (self.path.stat(), wal_path.stat())
+            except FileNotFoundError:
+                return self._read_schema_version(self.path, immutable=True)
+
+            with tempfile.TemporaryDirectory() as tmp:
+                staged_path = Path(tmp) / self.path.name
+                staged_wal_path = Path(f"{staged_path}-wal")
+                try:
+                    shutil.copyfile(self.path, staged_path)
+                    shutil.copyfile(wal_path, staged_wal_path)
+                    after = (self.path.stat(), wal_path.stat())
+                except FileNotFoundError:
+                    continue
+                before_signature = tuple(
+                    (value.st_size, value.st_mtime_ns) for value in before
+                )
+                after_signature = tuple(
+                    (value.st_size, value.st_mtime_ns) for value in after
+                )
+                if before_signature != after_signature:
+                    continue
+                return self._read_schema_version(staged_path, immutable=False)
+        raise RuntimeError("database WAL changed during schema preflight")
+
+    @staticmethod
+    def _read_schema_version(path: Path, *, immutable: bool) -> int:
+        query = "?mode=ro&immutable=1" if immutable else "?mode=ro"
+        uri = f"{path.resolve().as_uri()}{query}"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            metadata_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='metadata'"
+            ).fetchone()
+            if not metadata_exists:
+                return 0
+            version_row = conn.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()
+            return int(version_row[0]) if version_row else 0
+        finally:
+            conn.close()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path)
         try:
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
             yield conn
             conn.commit()
         except Exception:
@@ -60,7 +117,7 @@ class MonitorStorage:
         finally:
             conn.close()
 
-    def _initialize(self) -> None:
+    def _initialize(self, current_version: int) -> None:
         with self.connect() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS market_snapshots (
@@ -84,28 +141,6 @@ class MonitorStorage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_snapshots_item_time
                     ON market_snapshots(item_key, observed_at DESC);
-                CREATE TABLE IF NOT EXISTS monitor_state (
-                    item_key TEXT PRIMARY KEY,
-                    alert_active INTEGER NOT NULL DEFAULT 0,
-                    qualifying_count INTEGER NOT NULL DEFAULT 0,
-                    clearing_count INTEGER NOT NULL DEFAULT 0,
-                    fetch_failures INTEGER NOT NULL DEFAULT 0,
-                    health_alerted INTEGER NOT NULL DEFAULT 0,
-                    last_ratio REAL,
-                    last_signal_at TEXT,
-                    pending_signal_key TEXT,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS notification_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    signal_key TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    success INTEGER NOT NULL,
-                    message TEXT,
-                    attempted_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_notification_signal
-                    ON notification_events(signal_key, success);
                 CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -155,6 +190,7 @@ class MonitorStorage:
                     rule_type TEXT NOT NULL,
                     threshold REAL NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    operational INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -181,19 +217,16 @@ class MonitorStorage:
                     PRIMARY KEY(smis_id, recipient_key)
                 );
             """)
-            version_row = conn.execute(
-                "SELECT value FROM metadata WHERE key='schema_version'"
-            ).fetchone()
-            current_version = int(version_row[0]) if version_row else 0
-            if current_version > SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"database schema v{current_version} is newer than supported "
-                    f"v{SCHEMA_VERSION}"
-                )
             if current_version < 3:
                 self._migrate_v3(conn)
             if current_version < 4:
                 self._migrate_v4(conn)
+            if current_version < 5:
+                self._migrate_v5(conn)
+            if current_version < 6:
+                self._migrate_v6(conn)
+            if current_version < 7:
+                self._migrate_v7(conn)
 
     def _migrate_v3(self, conn: sqlite3.Connection) -> None:
         """Transactionally migrate v2 recipient and notification tables."""
@@ -280,15 +313,38 @@ class MonitorStorage:
                 WHERE s.alert_active=1 AND s.last_value IS NOT NULL
             """).fetchall()
             for row in rows:
-                value = float(row["last_value"])
-                threshold = float(row["threshold"])
-                limit = threshold / 100 if row["rule_type"] in {"ratio", "t7"} else threshold
-                depth = (
-                    (value - limit) / limit
-                    if row["rule_type"] == "steam"
-                    else (limit - value) / limit
-                )
-                level = max(0, int((max(0.0, depth) + 1e-12) / DEFAULT_BREAKTHROUGH_STEP))
+                try:
+                    value = float(row["last_value"])
+                    threshold = float(row["threshold"])
+                    rule_type = str(row["rule_type"]).strip().lower()
+                    limit = (
+                        threshold / 100
+                        if rule_type in {"ratio", "t7"}
+                        else threshold
+                    )
+                    if (
+                        not math.isfinite(value)
+                        or not math.isfinite(limit)
+                        or value <= 0
+                        or limit <= 0
+                    ):
+                        raise ValueError("invalid persisted rule state")
+                    depth = (
+                        (value - limit) / limit
+                        if rule_type == "steam"
+                        else (limit - value) / limit
+                    )
+                    level = max(
+                        0,
+                        int(
+                            (max(0.0, depth) + 1e-12)
+                            / DEFAULT_BREAKTHROUGH_STEP
+                        ),
+                    )
+                    if level > MAX_RULE_STATE_INTEGER:
+                        level = 0
+                except (TypeError, ValueError, OverflowError):
+                    level = 0
                 conn.execute(
                     "UPDATE rule_states SET highest_notified_level=? WHERE rule_id=?",
                     (level, int(row["rule_id"])),
@@ -304,6 +360,199 @@ class MonitorStorage:
             conn.execute("ROLLBACK TO SAVEPOINT migrate_v4")
             conn.execute("RELEASE SAVEPOINT migrate_v4")
             raise
+
+    def _migrate_v5(self, conn: sqlite3.Connection) -> None:
+        """Enforce one active rule per item, recipient, and rule type."""
+        conn.execute("SAVEPOINT migrate_v5")
+        try:
+            now = self._utcnow()
+            self._deduplicate_active_rules(conn, now)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_rules_active_identity
+                ON rules(smis_id,recipient_key,rule_type) WHERE enabled=1
+            """)
+            conn.execute("""
+                INSERT INTO metadata(key,value,updated_at) VALUES('schema_version','5',?)
+                ON CONFLICT(key) DO UPDATE SET value='5',updated_at=excluded.updated_at
+            """, (now,))
+            conn.execute("RELEASE SAVEPOINT migrate_v5")
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT migrate_v5")
+            conn.execute("RELEASE SAVEPOINT migrate_v5")
+            raise
+
+    def _migrate_v6(self, conn: sqlite3.Connection) -> None:
+        """Canonicalize public rule IDs and reconcile disabled-rule delivery state."""
+        conn.execute("SAVEPOINT migrate_v6")
+        try:
+            now = self._utcnow()
+            conn.execute("DROP INDEX IF EXISTS uq_rules_active_identity")
+            conn.execute("""
+                UPDATE rules
+                SET rule_type=lower(trim(rule_type)),updated_at=?
+                WHERE rule_type<>lower(trim(rule_type))
+            """, (now,))
+            self._deduplicate_active_rules(conn, now)
+            disabled = conn.execute(
+                "SELECT id,recipient_key FROM rules WHERE enabled=0"
+            ).fetchall()
+            for row in disabled:
+                self._cancel_pending_rule_jobs(
+                    conn,
+                    int(row["id"]),
+                    str(row["recipient_key"]),
+                )
+            conn.execute("""
+                CREATE UNIQUE INDEX uq_rules_active_identity
+                ON rules(smis_id,recipient_key,rule_type) WHERE enabled=1
+            """)
+            conn.execute("""
+                INSERT INTO metadata(key,value,updated_at) VALUES('schema_version','6',?)
+                ON CONFLICT(key) DO UPDATE SET value='6',updated_at=excluded.updated_at
+            """, (now,))
+            conn.execute("RELEASE SAVEPOINT migrate_v6")
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT migrate_v6")
+            conn.execute("RELEASE SAVEPOINT migrate_v6")
+            raise
+
+    def _migrate_v7(self, conn: sqlite3.Connection) -> None:
+        """Separate configured rules from rules that are safe to execute."""
+        conn.execute("SAVEPOINT migrate_v7")
+        try:
+            columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(rules)")
+            }
+            if "operational" not in columns:
+                conn.execute(
+                    "ALTER TABLE rules ADD COLUMN "
+                    "operational INTEGER NOT NULL DEFAULT 1"
+                )
+            conn.execute(
+                "UPDATE rules SET operational=0 "
+                "WHERE enabled<>1 OR operational<>1"
+            )
+            inactive_sessions = conn.execute("""
+                SELECT DISTINCT r.smis_id,r.recipient_key,
+                       COALESCE(i.item_key,(
+                           SELECT s.item_key FROM market_snapshots s
+                           WHERE s.smis_id=r.smis_id ORDER BY s.id DESC LIMIT 1
+                       ),'smis:' || r.smis_id) AS item_key
+                FROM rules r LEFT JOIN items i ON i.smis_id=r.smis_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM rules active
+                    WHERE active.smis_id=r.smis_id
+                      AND active.recipient_key=r.recipient_key
+                      AND active.enabled=1 AND active.operational=1
+                )
+            """).fetchall()
+            for row in inactive_sessions:
+                conn.execute(
+                    "DELETE FROM rule_health WHERE smis_id=? AND recipient_key=?",
+                    (int(row["smis_id"]), str(row["recipient_key"])),
+                )
+                self._cancel_pending_health_jobs(
+                    conn,
+                    str(row["item_key"]),
+                    str(row["recipient_key"]),
+                )
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_rules_operational
+                ON rules(smis_id,enabled,operational)
+            """)
+            now = self._utcnow()
+            conn.execute("""
+                INSERT INTO metadata(key,value,updated_at) VALUES('schema_version','7',?)
+                ON CONFLICT(key) DO UPDATE SET value='7',updated_at=excluded.updated_at
+            """, (now,))
+            conn.execute("RELEASE SAVEPOINT migrate_v7")
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT migrate_v7")
+            conn.execute("RELEASE SAVEPOINT migrate_v7")
+            raise
+
+    def _deduplicate_active_rules(
+        self,
+        conn: sqlite3.Connection,
+        updated_at: str,
+    ) -> None:
+        from .rules import validate_rule
+
+        rows = conn.execute("""
+            SELECT r.id,r.smis_id,r.recipient_key,r.rule_type,r.threshold,
+                   COALESCE(s.alert_active,0) AS alert_active
+            FROM rules r
+            LEFT JOIN rule_states s ON s.rule_id=r.id
+            WHERE r.enabled=1
+        """).fetchall()
+
+        def priority(row: sqlite3.Row) -> tuple[int, str, str, int, int, int]:
+            valid = validate_rule(str(row["rule_type"]), row["threshold"]) is None
+            try:
+                active_value = float(row["alert_active"])
+                active = active_value == 1
+            except (TypeError, ValueError):
+                active = False
+            return (
+                int(row["smis_id"]),
+                str(row["recipient_key"]),
+                str(row["rule_type"]),
+                0 if valid else 1,
+                0 if active else 1,
+                int(row["id"]),
+            )
+
+        seen: set[tuple[int, str, str]] = set()
+        for row in sorted(rows, key=priority):
+            identity = (
+                int(row["smis_id"]),
+                str(row["recipient_key"]),
+                str(row["rule_type"]),
+            )
+            if identity not in seen:
+                seen.add(identity)
+                continue
+            rule_id = int(row["id"])
+            recipient_key = str(row["recipient_key"])
+            conn.execute(
+                "UPDATE rules SET enabled=0,updated_at=? WHERE id=?",
+                (updated_at, rule_id),
+            )
+            self._cancel_pending_rule_jobs(conn, rule_id, recipient_key)
+
+    @staticmethod
+    def _cancel_pending_rule_jobs(
+        conn: sqlite3.Connection,
+        rule_id: int,
+        recipient_key: str,
+    ) -> int:
+        prefix = f"rule:{int(rule_id)}:"
+        cursor = conn.execute("""
+            DELETE FROM delivery_jobs
+            WHERE status='pending' AND event_id IN (
+                SELECT id FROM alert_events
+                WHERE recipient_key=? AND (
+                    rule_id=? OR substr(signal_key,1,?)=?
+                )
+            )
+        """, (recipient_key, int(rule_id), len(prefix), prefix))
+        return int(cursor.rowcount)
+
+    @staticmethod
+    def _cancel_pending_health_jobs(
+        conn: sqlite3.Connection,
+        item_key: str,
+        recipient_key: str,
+    ) -> int:
+        prefix = f"health:{item_key}:{recipient_key}:"
+        cursor = conn.execute("""
+            DELETE FROM delivery_jobs
+            WHERE status='pending' AND event_id IN (
+                SELECT id FROM alert_events
+                WHERE recipient_key=? AND substr(signal_key,1,?)=?
+            )
+        """, (recipient_key, len(prefix), prefix))
+        return int(cursor.rowcount)
 
     @staticmethod
     def _utcnow() -> str:
@@ -364,17 +613,38 @@ class MonitorStorage:
     def count_rule_items(self) -> int:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(DISTINCT smis_id) FROM rules WHERE enabled=1"
+                "SELECT COUNT(DISTINCT smis_id) FROM rules "
+                "WHERE enabled=1 AND operational=1"
             ).fetchone()
         return int(row[0])
 
     def add_rule(
-        self, smis_id: int, recipient_key: str, rule_type: str, threshold: float
+        self,
+        smis_id: int,
+        recipient_key: str,
+        rule_type: str,
+        threshold: float,
+        *,
+        max_items: int | None = None,
     ) -> dict:
         now = self._utcnow()
+        rule_type = str(rule_type).strip().lower()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            has_active_rule = conn.execute(
+                "SELECT 1 FROM rules "
+                "WHERE smis_id=? AND enabled=1 AND operational=1 LIMIT 1",
+                (int(smis_id),),
+            ).fetchone()
+            if not has_active_rule and max_items is not None:
+                active_items = int(conn.execute(
+                    "SELECT COUNT(DISTINCT smis_id) FROM rules "
+                    "WHERE enabled=1 AND operational=1"
+                ).fetchone()[0])
+                if active_items >= int(max_items):
+                    raise RuleItemLimitError(int(max_items))
             existing = conn.execute("""
-                SELECT id,threshold FROM rules
+                SELECT id,threshold,operational FROM rules
                 WHERE smis_id=? AND recipient_key=? AND rule_type=? AND enabled=1
                 ORDER BY id
             """, (int(smis_id), recipient_key, rule_type)).fetchall()
@@ -382,10 +652,15 @@ class MonitorStorage:
                 rule_id = int(existing[0]["id"])
                 previous_threshold = float(existing[0]["threshold"])
                 duplicate_ids = [int(row["id"]) for row in existing[1:]]
-                changed = previous_threshold != float(threshold) or bool(duplicate_ids)
+                changed = (
+                    previous_threshold != float(threshold)
+                    or parse_rule_state_integer(existing[0]["operational"]) != 1
+                    or bool(duplicate_ids)
+                )
                 if changed:
                     conn.execute(
-                        "UPDATE rules SET threshold=?,updated_at=? WHERE id=?",
+                        "UPDATE rules SET threshold=?,operational=1,updated_at=? "
+                        "WHERE id=?",
                         (float(threshold), now, rule_id),
                     )
                     affected_ids = [rule_id, *duplicate_ids]
@@ -395,10 +670,10 @@ class MonitorStorage:
                         affected_ids,
                     )
                     for affected_id in affected_ids:
-                        conn.execute(
-                            "DELETE FROM delivery_jobs WHERE status='pending' AND event_id IN "
-                            "(SELECT id FROM alert_events WHERE recipient_key=? AND signal_key LIKE ?)",
-                            (recipient_key, f"rule:{affected_id}:%"),
+                        self._cancel_pending_rule_jobs(
+                            conn,
+                            affected_id,
+                            recipient_key,
                         )
                     if duplicate_ids:
                         duplicate_placeholders = ",".join("?" for _ in duplicate_ids)
@@ -410,9 +685,10 @@ class MonitorStorage:
             else:
                 cursor = conn.execute("""
                     INSERT INTO rules(
-                        smis_id,recipient_key,rule_type,threshold,enabled,created_at,updated_at
+                        smis_id,recipient_key,rule_type,threshold,enabled,operational,
+                        created_at,updated_at
                     )
-                    VALUES(?,?,?,?,1,?,?)
+                    VALUES(?,?,?,?,1,1,?,?)
                 """, (int(smis_id), recipient_key, rule_type, float(threshold), now, now))
                 rule_id = int(cursor.lastrowid)
                 previous_threshold = None
@@ -422,17 +698,27 @@ class MonitorStorage:
         rule["previous_threshold"] = previous_threshold
         return rule
 
+    def delete_item_if_unreferenced(self, smis_id: int) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute("""
+                DELETE FROM items
+                WHERE smis_id=? AND NOT EXISTS (
+                    SELECT 1 FROM rules WHERE rules.smis_id=items.smis_id
+                )
+            """, (int(smis_id),))
+            return bool(cursor.rowcount)
+
     def get_rule(self, rule_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute("""
                 SELECT r.*,i.item_key,i.appid,i.hash_name,i.cn_name
-                FROM rules r JOIN items i USING(smis_id) WHERE r.id=?
+                FROM rules r LEFT JOIN items i USING(smis_id) WHERE r.id=?
             """, (int(rule_id),)).fetchone()
         return dict(row) if row else None
 
     def list_rules(
         self, *, recipient_key: str | None = None, smis_id: int | None = None,
-        enabled_only: bool = True,
+        enabled_only: bool = True, operational_only: bool = False,
     ) -> list[dict[str, Any]]:
         clauses, params = [], []
         if recipient_key is not None:
@@ -441,49 +727,127 @@ class MonitorStorage:
         if smis_id is not None:
             clauses.append("r.smis_id=?")
             params.append(int(smis_id))
-        if enabled_only:
+        if enabled_only or operational_only:
             clauses.append("r.enabled=1")
+        if operational_only:
+            clauses.append("r.operational=1")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as conn:
             rows = conn.execute(f"""
                 SELECT r.*,i.item_key,i.appid,i.hash_name,i.cn_name
-                FROM rules r JOIN items i USING(smis_id) {where}
+                FROM rules r LEFT JOIN items i USING(smis_id) {where}
                 ORDER BY i.cn_name COLLATE NOCASE,r.id
             """, params).fetchall()
         return [dict(row) for row in rows]
 
     def update_rule(
-        self, rule_id: int, recipient_key: str, threshold: float
+        self, rule_id: int, recipient_key: str, threshold: float, *,
+        max_items: int | None = None,
     ) -> dict | None:
         now = self._utcnow()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT smis_id,operational FROM rules "
+                "WHERE id=? AND recipient_key=? AND enabled=1",
+                (int(rule_id), recipient_key),
+            ).fetchone()
+            if current is None:
+                return None
+            if (
+                parse_rule_state_integer(current["operational"]) != 1
+                and max_items is not None
+            ):
+                has_active_rule = conn.execute(
+                    "SELECT 1 FROM rules WHERE smis_id=? AND enabled=1 "
+                    "AND operational=1 LIMIT 1",
+                    (int(current["smis_id"]),),
+                ).fetchone()
+                active_items = int(conn.execute(
+                    "SELECT COUNT(DISTINCT smis_id) FROM rules "
+                    "WHERE enabled=1 AND operational=1"
+                ).fetchone()[0])
+                if not has_active_rule and active_items >= int(max_items):
+                    raise RuleItemLimitError(int(max_items))
             cursor = conn.execute(
-                "UPDATE rules SET threshold=?,updated_at=? WHERE id=? AND recipient_key=?",
+                "UPDATE rules SET threshold=?,operational=1,updated_at=? "
+                "WHERE id=? AND recipient_key=? AND enabled=1",
                 (float(threshold), now, int(rule_id), recipient_key),
             )
             if not cursor.rowcount:
                 return None
             conn.execute("DELETE FROM rule_states WHERE rule_id=?", (int(rule_id),))
+            self._cancel_pending_rule_jobs(conn, int(rule_id), recipient_key)
         return self.get_rule(rule_id)
+
+    def set_rule_operational(
+        self,
+        rule_id: int,
+        recipient_key: str,
+        operational: bool,
+    ) -> bool:
+        with self.connect() as conn:
+            rule = conn.execute(
+                "SELECT r.smis_id,COALESCE(i.item_key,("
+                "SELECT s.item_key FROM market_snapshots s "
+                "WHERE s.smis_id=r.smis_id ORDER BY s.id DESC LIMIT 1"
+                "),'smis:' || r.smis_id) AS item_key FROM rules r "
+                "LEFT JOIN items i ON i.smis_id=r.smis_id "
+                "WHERE r.id=? AND r.recipient_key=? AND r.enabled=1",
+                (int(rule_id), recipient_key),
+            ).fetchone()
+            if rule is None:
+                return False
+            cursor = conn.execute(
+                "UPDATE rules SET operational=?,updated_at=? "
+                "WHERE id=? AND recipient_key=? AND enabled=1",
+                (
+                    int(bool(operational)),
+                    self._utcnow(),
+                    int(rule_id),
+                    recipient_key,
+                ),
+            )
+            if not operational:
+                smis_id = int(rule["smis_id"])
+                remaining = conn.execute(
+                    "SELECT 1 FROM rules WHERE smis_id=? AND recipient_key=? "
+                    "AND enabled=1 AND operational=1 LIMIT 1",
+                    (smis_id, recipient_key),
+                ).fetchone()
+                if remaining is None:
+                    conn.execute(
+                        "DELETE FROM rule_health WHERE smis_id=? AND recipient_key=?",
+                        (smis_id, recipient_key),
+                    )
+                    self._cancel_pending_health_jobs(
+                        conn,
+                        str(rule["item_key"]),
+                        recipient_key,
+                    )
+        return bool(cursor.rowcount)
 
     def delete_rule(self, rule_id: int, recipient_key: str) -> bool:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT smis_id FROM rules WHERE id=? AND recipient_key=?",
+                "SELECT r.smis_id,COALESCE(i.item_key,("
+                "SELECT s.item_key FROM market_snapshots s "
+                "WHERE s.smis_id=r.smis_id ORDER BY s.id DESC LIMIT 1"
+                "),'smis:' || r.smis_id) AS item_key FROM rules r "
+                "LEFT JOIN items i ON i.smis_id=r.smis_id "
+                "WHERE r.id=? AND r.recipient_key=?",
                 (int(rule_id), recipient_key),
             ).fetchone()
             if not row:
                 return False
-            smis_id = int(row[0])
+            smis_id = int(row["smis_id"])
+            item_key = str(row["item_key"])
             conn.execute("DELETE FROM rules WHERE id=?", (int(rule_id),))
             conn.execute("DELETE FROM rule_states WHERE rule_id=?", (int(rule_id),))
-            conn.execute(
-                "DELETE FROM delivery_jobs WHERE status='pending' AND event_id IN "
-                "(SELECT id FROM alert_events WHERE recipient_key=? AND signal_key LIKE ?)",
-                (recipient_key, f"rule:{int(rule_id)}:%"),
-            )
+            self._cancel_pending_rule_jobs(conn, int(rule_id), recipient_key)
             session_remaining = conn.execute(
-                "SELECT COUNT(*) FROM rules WHERE smis_id=? AND recipient_key=?",
+                "SELECT COUNT(*) FROM rules "
+                "WHERE smis_id=? AND recipient_key=? AND enabled=1 AND operational=1",
                 (smis_id, recipient_key),
             ).fetchone()[0]
             if not session_remaining:
@@ -491,11 +855,7 @@ class MonitorStorage:
                     "DELETE FROM rule_health WHERE smis_id=? AND recipient_key=?",
                     (smis_id, recipient_key),
                 )
-                conn.execute(
-                    "DELETE FROM delivery_jobs WHERE status='pending' AND event_id IN "
-                    "(SELECT id FROM alert_events WHERE recipient_key=? AND signal_key LIKE ?)",
-                    (recipient_key, f"health:smis:{smis_id}:{recipient_key}:%"),
-                )
+                self._cancel_pending_health_jobs(conn, item_key, recipient_key)
             remaining = conn.execute(
                 "SELECT COUNT(*) FROM rules WHERE smis_id=?", (smis_id,)
             ).fetchone()[0]
@@ -503,6 +863,14 @@ class MonitorStorage:
                 conn.execute("DELETE FROM items WHERE smis_id=?", (smis_id,))
                 conn.execute("DELETE FROM rule_health WHERE smis_id=?", (smis_id,))
         return True
+
+    def cancel_pending_rule_notifications(
+        self,
+        rule_id: int,
+        recipient_key: str,
+    ) -> int:
+        with self.connect() as conn:
+            return self._cancel_pending_rule_jobs(conn, rule_id, recipient_key)
 
     def get_rule_state(self, rule_id: int) -> dict[str, Any]:
         with self.connect() as conn:
@@ -521,6 +889,20 @@ class MonitorStorage:
             if key not in DEFAULT_RULE_STATE:
                 raise KeyError(f"未知规则状态字段: {key}")
             state[key] = value
+        integer_values = {
+            key: parse_rule_state_integer(state[key])
+            for key in (
+                "alert_active",
+                "qualifying_count",
+                "clearing_count",
+                "highest_notified_level",
+            )
+        }
+        if (
+            any(value is None for value in integer_values.values())
+            or integer_values["alert_active"] not in {0, 1}
+        ):
+            raise ValueError("规则状态整数超出有效范围")
         now = self._utcnow()
         with self.connect() as conn:
             conn.execute("""
@@ -540,25 +922,33 @@ class MonitorStorage:
                     highest_notified_level=excluded.highest_notified_level,
                     status=excluded.status,updated_at=excluded.updated_at
             """, (
-                int(rule_id), int(state["alert_active"]), int(state["qualifying_count"]),
-                int(state["clearing_count"]), state["last_value"], state["last_baseline"],
+                int(rule_id), integer_values["alert_active"],
+                integer_values["qualifying_count"], integer_values["clearing_count"],
+                state["last_value"], state["last_baseline"],
                 state["last_observed_at"], state["last_signal_at"],
-                int(state["highest_notified_level"]), state["status"], now,
+                integer_values["highest_notified_level"], state["status"], now,
             ))
         return self.get_rule_state(rule_id)
 
-    def reset_rule_states(self, rule_type: str) -> int:
+    def reset_rule_states(
+        self,
+        rule_type: str,
+        *,
+        operational_only: bool = False,
+    ) -> int:
         """Reset evaluation state and cancel pending alerts for one rule type."""
+        operational_clause = " AND enabled=1 AND operational=1" if operational_only else ""
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT id,recipient_key FROM rules WHERE rule_type=?", (rule_type,)
+                "SELECT id,recipient_key FROM rules WHERE rule_type=?"
+                f"{operational_clause}",
+                (rule_type,),
             ).fetchall()
             for row in rows:
-                conn.execute(
-                    "DELETE FROM delivery_jobs WHERE status='pending' AND event_id IN "
-                    "(SELECT id FROM alert_events WHERE recipient_key=? "
-                    "AND signal_key LIKE ?)",
-                    (str(row["recipient_key"]), f"rule:{int(row['id'])}:%"),
+                self._cancel_pending_rule_jobs(
+                    conn,
+                    int(row["id"]),
+                    str(row["recipient_key"]),
                 )
                 conn.execute(
                     "DELETE FROM rule_states WHERE rule_id=?", (int(row["id"]),)
@@ -581,6 +971,10 @@ class MonitorStorage:
     ) -> dict:
         state = self.get_health_state(smis_id, recipient_key)
         state.update(changes)
+        failures = parse_rule_state_integer(state["fetch_failures"])
+        alerted = parse_rule_state_integer(state["health_alerted"])
+        if failures is None or alerted not in {0, 1}:
+            raise ValueError("健康状态整数超出有效范围")
         now = self._utcnow()
         with self.connect() as conn:
             conn.execute("""
@@ -589,8 +983,7 @@ class MonitorStorage:
                 ) VALUES(?,?,?,?,?) ON CONFLICT(smis_id,recipient_key) DO UPDATE SET
                     fetch_failures=excluded.fetch_failures,
                     health_alerted=excluded.health_alerted,updated_at=excluded.updated_at
-            """, (int(smis_id), recipient_key, int(state["fetch_failures"]),
-                    int(state["health_alerted"]), now))
+            """, (int(smis_id), recipient_key, failures, alerted, now))
         return self.get_health_state(smis_id, recipient_key)
 
     def enqueue_notification(
@@ -728,18 +1121,50 @@ class MonitorStorage:
             """, rows)
             return conn.total_changes - before
 
-    def steam_history(self, item_key: str, days: int = 7) -> list[dict[str, Any]]:
+    def steam_history(
+        self,
+        item_key: str,
+        days: int = 7,
+        *,
+        max_current_lag_seconds: int | None = None,
+    ) -> list[dict[str, Any]]:
         from datetime import timedelta
 
         cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days))).isoformat()
         with self.connect() as conn:
             rows = conn.execute("""
-                SELECT source_updated_at,steam_sell_price FROM market_snapshots
+                SELECT kind,observed_at,source_updated_at,steam_sell_price
+                FROM market_snapshots
                 WHERE item_key=? AND source_updated_at>=? AND steam_sell_price>0
                 ORDER BY source_updated_at
             """, (item_key, cutoff)).fetchall()
         deduped: dict[str, float] = {}
+        now = datetime.now(timezone.utc)
         for row in rows:
+            try:
+                source = datetime.fromisoformat(str(row["source_updated_at"]))
+                if source.tzinfo is None:
+                    source = source.replace(tzinfo=timezone.utc)
+                if (
+                    source.astimezone(timezone.utc)
+                    > now + timedelta(seconds=MAX_SOURCE_FUTURE_SKEW_SECONDS)
+                ):
+                    continue
+                if (
+                    str(row["kind"]) == "current"
+                    and max_current_lag_seconds is not None
+                ):
+                    observed = datetime.fromisoformat(str(row["observed_at"]))
+                    if observed.tzinfo is None:
+                        observed = observed.replace(tzinfo=timezone.utc)
+                    lag_seconds = (observed - source).total_seconds()
+                    if (
+                        lag_seconds < -MAX_SOURCE_FUTURE_SKEW_SECONDS
+                        or lag_seconds > max(0, int(max_current_lag_seconds))
+                    ):
+                        continue
+            except (TypeError, ValueError):
+                continue
             deduped[str(row["source_updated_at"])] = float(row["steam_sell_price"])
         return [
             {"source_updated_at": key, "steam_sell_price": value}
@@ -761,23 +1186,15 @@ class MonitorStorage:
             """, (item_key, cutoff)).fetchall()
         return [dict(row) for row in rows]
 
-    def earliest_market_time(self, item_key: str) -> str | None:
-        with self.connect() as conn:
-            row = conn.execute("""
-                SELECT MIN(
-                    CASE WHEN kind='current' THEN observed_at ELSE source_updated_at END
-                ) FROM market_snapshots
-                WHERE item_key=? AND steam_sell_price>0
-            """, (item_key,)).fetchone()
-        return str(row[0]) if row and row[0] else None
-
     def prune_snapshots(self, retain_days: int = 30) -> int:
         from datetime import timedelta
 
         cutoff = (datetime.now(timezone.utc) - timedelta(days=int(retain_days))).isoformat()
         with self.connect() as conn:
             cursor = conn.execute(
-                "DELETE FROM market_snapshots WHERE observed_at<?", (cutoff,)
+                "DELETE FROM market_snapshots "
+                "WHERE observed_at<? OR datetime(observed_at) IS NULL",
+                (cutoff,),
             )
             return int(cursor.rowcount)
 
@@ -794,47 +1211,6 @@ class MonitorStorage:
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
             """, (key, value, now))
 
-    def get_state(self, item_key: str) -> dict[str, Any]:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM monitor_state WHERE item_key=?", (item_key,)).fetchone()
-        state = dict(DEFAULT_STATE)
-        if row:
-            state.update(dict(row))
-        state["item_key"] = item_key
-        return state
-
-    def update_state(self, item_key: str, **changes: Any) -> dict[str, Any]:
-        state = self.get_state(item_key)
-        for key, value in changes.items():
-            if key not in DEFAULT_STATE:
-                raise KeyError(f"未知监控状态字段: {key}")
-            state[key] = value
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connect() as conn:
-            conn.execute("""
-                INSERT INTO monitor_state(
-                    item_key,alert_active,qualifying_count,clearing_count,
-                    fetch_failures,health_alerted,last_ratio,last_signal_at,
-                    pending_signal_key,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(item_key) DO UPDATE SET
-                    alert_active=excluded.alert_active,
-                    qualifying_count=excluded.qualifying_count,
-                    clearing_count=excluded.clearing_count,
-                    fetch_failures=excluded.fetch_failures,
-                    health_alerted=excluded.health_alerted,
-                    last_ratio=excluded.last_ratio,
-                    last_signal_at=excluded.last_signal_at,
-                    pending_signal_key=excluded.pending_signal_key,
-                    updated_at=excluded.updated_at
-            """, (
-                item_key, int(state["alert_active"]), state["qualifying_count"],
-                state["clearing_count"], state["fetch_failures"],
-                int(state["health_alerted"]), state["last_ratio"],
-                state["last_signal_at"], state["pending_signal_key"], now,
-            ))
-        return self.get_state(item_key)
-
     def history_ratios(self, item_key: str) -> list[float]:
         with self.connect() as conn:
             rows = conn.execute("""
@@ -848,7 +1224,8 @@ class MonitorStorage:
         with self.connect() as conn:
             row = conn.execute("""
                 SELECT * FROM market_snapshots WHERE item_key=? AND kind='current'
-                ORDER BY observed_at DESC LIMIT 1
+                  AND datetime(observed_at) IS NOT NULL
+                ORDER BY julianday(observed_at) DESC,id DESC LIMIT 1
             """, (item_key,)).fetchone()
         return dict(row) if row else None
 
@@ -856,23 +1233,7 @@ class MonitorStorage:
         with self.connect() as conn:
             rows = conn.execute("""
                 SELECT * FROM market_snapshots WHERE item_key=? AND kind='current'
-                ORDER BY observed_at DESC LIMIT ?
+                  AND datetime(observed_at) IS NOT NULL
+                ORDER BY julianday(observed_at) DESC,id DESC LIMIT ?
             """, (item_key, limit)).fetchall()
         return [dict(row) for row in rows]
-
-    def record_notification(self, signal_key: str, event_type: str, success: bool, message: str) -> None:
-        with self.connect() as conn:
-            conn.execute("""
-                INSERT INTO notification_events(signal_key,event_type,success,message,attempted_at)
-                VALUES(?,?,?,?,?)
-            """, (
-                signal_key, event_type, int(success), message,
-                datetime.now(timezone.utc).isoformat(),
-            ))
-
-    def was_notification_sent(self, signal_key: str) -> bool:
-        with self.connect() as conn:
-            row = conn.execute("""
-                SELECT 1 FROM notification_events WHERE signal_key=? AND success=1 LIMIT 1
-            """, (signal_key,)).fetchone()
-        return row is not None

@@ -1,15 +1,15 @@
 import json
 import sqlite3
-import threading
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from core.events import NotifyResult
 from core.manager import MonitoringManager
 from core.market import MarketSnapshot, steam_net_amount
-from core.repository import MonitorStorage
+from core.presentation import analysis_reference_lines
+from core.repository import SCHEMA_VERSION, MonitorStorage
+from core.rules import get_rule_definition
 
 ITEM = {
     "smis_id": 1579,
@@ -90,31 +90,13 @@ class StaleSource(FakeSource):
         })
 
 
-class FakeNotifier:
-    def __init__(self, failing_umo=None):
-        self.name = "fake"
-        self.failing_umo = failing_umo
-        self.messages = []
-
-    def send_to(self, umo, title, content):
-        self.messages.append((umo, title, content))
-        if umo == self.failing_umo:
-            return NotifyResult(False, "failed")
-        return NotifyResult(True, "ok")
-
-
-class FakeRuntime:
-    def __init__(self):
-        self.started = False
-
-    def start(self):
-        self.started = True
-
-    def stop(self):
-        self.started = False
-
-    def status(self):
-        return {"running": self.started, "items": 1, "rules": 1, "outbox": {}}
+class FutureSource(FakeSource):
+    def fetch_current(self, item):
+        value = super().fetch_current(item)
+        return MarketSnapshot(**{
+            **value.__dict__,
+            "source_updated_at": datetime.now(timezone.utc) + timedelta(days=2),
+        })
 
 
 class ServiceTestCase(unittest.TestCase):
@@ -126,11 +108,22 @@ class ServiceTestCase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def manager(self, ratios=None, notifier=None, cache=60):
+    def manager(self, ratios=None, cache=60):
         return MonitoringManager(
-            self.storage, FakeSource(ratios), notifier or FakeNotifier(),
+            self.storage, FakeSource(ratios),
             quote_cache_seconds=cache,
         )
+
+    def stored_messages(self, event_type=None):
+        sql = "SELECT recipient_key,title,content FROM alert_events"
+        params = ()
+        if event_type is not None:
+            sql += " WHERE event_type=?"
+            params = (event_type,)
+        sql += " ORDER BY id"
+        with self.storage.connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [tuple(row) for row in rows]
 
     def test_existing_snapshot_table_gets_platform_columns(self):
         legacy_path = Path(self.tmp.name) / "legacy.db"
@@ -196,7 +189,7 @@ class ServiceTestCase(unittest.TestCase):
             version = connection.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()[0]
-        self.assertEqual(version, "4")
+        self.assertEqual(version, str(SCHEMA_VERSION))
 
         reopened = MonitorStorage(legacy_path)
         self.assertEqual(reopened.get_rule(1)["recipient_key"], "recipient:a")
@@ -229,7 +222,7 @@ class ServiceTestCase(unittest.TestCase):
         state = migrated.get_rule_state(rule["id"])
         self.assertEqual(state["highest_notified_level"], 2)
         MonitoringManager(
-            migrated, FakeSource([0.67]), FakeNotifier(),
+            migrated, FakeSource([0.67]),
             breakthrough_step_percent=1,
         )
         self.assertEqual(
@@ -246,7 +239,7 @@ class ServiceTestCase(unittest.TestCase):
             ratio_rule["id"], alert_active=1, last_value=0.70, status="active"
         )
 
-        MonitoringManager(self.storage, FakeSource(), FakeNotifier())
+        MonitoringManager(self.storage, FakeSource())
 
         self.assertEqual(
             self.storage.get_metadata("alerting:t7_basis"),
@@ -258,58 +251,6 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(
             self.storage.get_rule_state(ratio_rule["id"])["alert_active"], 1
         )
-
-    @unittest.skip("独立服务 YAML 配置不属于纯插件")
-    def test_monitor_yaml_config_loads_nested_settings(self):
-        path = Path(self.tmp.name) / "monitor.yaml"
-        path.write_text("""
-service:
-  token: secret
-  database: ./state.db
-  backup_dir: ./backups
-monitor:
-  interval_seconds: 1800
-  quote_cache_seconds: 90
-  max_items: 10
-alerts:
-  driver: astrbot
-  breakthrough_step_percent: 4
-  daily_summary_time: '08:30'
-smis:
-  timeout_seconds: 12
-  max_retries: 2
-  min_request_interval_seconds: 1.5
-astrbot:
-  base_url: http://astrbot:6185
-  api_key: key
-  message_path: /api/v1/im/message
-  timeout_seconds: 8
-""", encoding="utf-8")
-
-        config = load_config(path)
-
-        self.assertEqual(config.service_token, "secret")
-        self.assertEqual(config.alert_driver, "astrbot")
-        self.assertEqual(config.breakthrough_step_percent, 4)
-        self.assertEqual(config.daily_summary_time, "08:30")
-        self.assertEqual(config.quote_cache_seconds, 90)
-        self.assertEqual(config.smis_min_request_interval_seconds, 1.5)
-
-    @unittest.skip("独立服务 YAML 配置不属于纯插件")
-    def test_monitor_yaml_config_rejects_missing_token_and_astrbot_key(self):
-        path = Path(self.tmp.name) / "monitor.yaml"
-        path.write_text("service: {}\n", encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "service.token"):
-            load_config(path)
-
-        path.write_text("""
-service:
-  token: secret
-alerts:
-  driver: astrbot
-""", encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "astrbot.api_key"):
-            load_config(path)
 
     def test_quote_uses_sixty_second_cache(self):
         manager = self.manager([0.70])
@@ -371,21 +312,21 @@ alerts:
             "smis_id": 1579, "name_zh": "裂空武器箱", "rarity": "普通级",
         }])
 
-    @unittest.skip("独立 FastAPI 服务不属于纯插件")
-    def test_search_failure_uses_service_error_envelope(self):
+    def test_item_listing_is_scoped_to_current_recipient(self):
         manager = self.manager()
-        manager.source.search_items = lambda query, limit=10: (_ for _ in ()).throw(
-            RuntimeError("down")
-        )
-        app = create_app(manager=manager, runtime=FakeRuntime(), service_token="secret")
-        with TestClient(app) as client:
-            response = client.get(
-                "/v2/market/search",
-                headers={"Authorization": "Bearer secret"},
-                params={"q": "裂空"},
-            )
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json()["error"]["code"], "smis_search_failed")
+        self.storage.upsert_item({
+            "smis_id": 2000,
+            "item_key": "smis:2000",
+            "appid": 730,
+            "name": "Other Item",
+            "name_zh": "其他饰品",
+        })
+        self.storage.add_rule(1579, "umo:a", "ratio", 72)
+        self.storage.add_rule(2000, "umo:b", "ratio", 72)
+
+        rows = manager.list_items("umo:a")
+
+        self.assertEqual([int(row["smis_id"]) for row in rows], [1579])
 
     def test_stale_quote_falls_back_when_source_fails(self):
         self.storage.save_snapshots([snapshot(0.70, -120)])
@@ -397,30 +338,27 @@ alerts:
         self.assertEqual(result["risk_assessment"]["status"], "unavailable")
 
     def test_ratio_rules_are_session_isolated_and_rearm_after_three_percent_margin(self):
-        notifier = FakeNotifier()
-        manager = self.manager([0.70, 0.70, 0.75, 0.75, 0.70, 0.70], notifier)
+        manager = self.manager([0.70, 0.70, 0.75, 0.75, 0.70, 0.70])
         first = self.storage.add_rule(1579, "umo:a", "ratio", 72)
         second = self.storage.add_rule(1579, "umo:b", "ratio", 68)
         for _ in range(6):
             manager.run_cycle(max_workers=1)
-        recipients = [message[0] for message in notifier.messages]
+        recipients = [message[0] for message in self.stored_messages()]
         self.assertEqual(recipients, ["umo:a", "umo:a"])
         self.assertEqual(self.storage.get_rule_state(second["id"])["alert_active"], 0)
         self.assertEqual(self.storage.get_rule_state(first["id"])["alert_active"], 1)
 
     def test_rule_fires_on_first_qualifying_cycle(self):
-        notifier = FakeNotifier()
-        manager = self.manager([0.70], notifier)
+        manager = self.manager([0.70])
         rule = self.storage.add_rule(1579, "umo:a", "ratio", 72)
 
         manager.run_cycle(max_workers=1)
 
-        self.assertEqual(len(notifier.messages), 1)
+        self.assertEqual(len(self.stored_messages()), 1)
         self.assertEqual(self.storage.get_rule_state(rule["id"])["alert_active"], 1)
 
     def test_breakthrough_levels_are_arithmetic_and_do_not_repeat(self):
-        notifier = FakeNotifier()
-        manager = self.manager([0.72, 0.69, 0.70, 0.66, 0.75, 0.69], notifier)
+        manager = self.manager([0.72, 0.69, 0.70, 0.66, 0.75, 0.69])
         rule = self.storage.add_rule(1579, "umo:a", "ratio", 72)
 
         manager.run_cycle(max_workers=1)  # initial, level 0
@@ -430,12 +368,13 @@ alerts:
         manager.run_cycle(max_workers=1)  # clears in one cycle
         manager.run_cycle(max_workers=1)  # new incident
 
-        titles = [message[1] for message in notifier.messages]
+        messages = self.stored_messages()
+        titles = [message[1] for message in messages]
         self.assertEqual(len(titles), 4)
         self.assertIn("第 1 档", titles[1])
         self.assertIn("第 2 档", titles[2])
         self.assertIn("第 1 档", titles[3])
-        breakthrough = notifier.messages[1][2]
+        breakthrough = messages[1][2]
         self.assertIn("最低平台：", breakthrough)
         self.assertIn("Steam 预计到手：", breakthrough)
         self.assertIn("七日历史基准：", breakthrough)
@@ -446,14 +385,13 @@ alerts:
         self.assertEqual(self.storage.get_rule_state(rule["id"])["highest_notified_level"], 1)
 
     def test_breakthrough_alerts_again_after_level_retreat_and_reentry(self):
-        notifier = FakeNotifier()
-        manager = self.manager([0.72, 0.66, 0.69, 0.66], notifier)
+        manager = self.manager([0.72, 0.66, 0.69, 0.66])
         rule = self.storage.add_rule(1579, "umo:a", "ratio", 72)
 
         for _ in range(4):
             manager.run_cycle(max_workers=1)
 
-        titles = [message[1] for message in notifier.messages]
+        titles = [message[1] for message in self.stored_messages()]
         self.assertEqual(len(titles), 3)
         self.assertNotIn("第", titles[0])
         self.assertIn("第 2 档", titles[1])
@@ -463,11 +401,19 @@ alerts:
         )
 
     def test_breakthrough_level_includes_exact_three_percent_boundary(self):
-        manager = self.manager()
-        self.assertEqual(manager._breakthrough_level("ratio", 0.72, 0.6984)[0], 1)
-        self.assertEqual(manager._breakthrough_level("t7", 0.72, 0.6984)[0], 1)
-        self.assertEqual(manager._breakthrough_level("platform", 100, 97)[0], 1)
-        self.assertEqual(manager._breakthrough_level("steam", 100, 106)[0], 2)
+        cases = (
+            ("ratio", 0.72, 0.6984, 1),
+            ("t7", 0.72, 0.6984, 1),
+            ("platform", 100, 97, 1),
+            ("steam", 100, 106, 2),
+        )
+        for rule_type, limit, value, expected in cases:
+            with self.subTest(rule_type=rule_type):
+                definition = get_rule_definition(rule_type)
+                self.assertEqual(
+                    definition.breakthrough(value, limit, 0.03)[0],
+                    expected,
+                )
 
     def test_ready_analysis_message_separates_forecast_and_risk_ratios(self):
         forecast = {
@@ -489,7 +435,7 @@ alerts:
             "reasons": ["预计七日下跌 5.4%"],
         }
 
-        lines = self.manager()._analysis_reference_lines(forecast, risk)
+        lines = analysis_reference_lines(forecast, risk)
         content = "\n".join(lines)
 
         self.assertIn("预测倒余额比例 72.17%", content)
@@ -513,7 +459,7 @@ alerts:
             "reasons": [],
         }
 
-        current_lines = self.manager()._analysis_reference_lines(
+        current_lines = analysis_reference_lines(
             forecast, risk, current_steam_net=4.67, t7_steam_net_p25=4.60,
         )
         self.assertIn(
@@ -522,7 +468,7 @@ alerts:
         )
 
         risk.update({"risk_steam_net": 4.42, "risk_balance_ratio": 0.7217})
-        forecast_lines = self.manager()._analysis_reference_lines(
+        forecast_lines = analysis_reference_lines(
             forecast, risk, current_steam_net=4.67, t7_steam_net_p25=4.60,
         )
         self.assertIn(
@@ -531,22 +477,19 @@ alerts:
         )
 
     def test_daily_summary_groups_active_rules_once_per_day(self):
-        notifier = FakeNotifier()
-        manager = self.manager([0.70], notifier)
+        manager = self.manager([0.70])
         self.storage.add_rule(1579, "umo:a", "ratio", 72)
         self.storage.add_rule(1579, "umo:a", "platform", 3.40)
         manager.run_cycle(max_workers=1)
-        notifier.messages.clear()
 
         self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 1)
-        manager.dispatch_outbox()
-        self.assertEqual(len(notifier.messages), 1)
-        self.assertIn("共 2 条", notifier.messages[0][2])
-        self.assertIn("预测", notifier.messages[0][2])
-        self.assertIn("风险", notifier.messages[0][2])
+        messages = self.stored_messages("daily_summary")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("共 2 条", messages[0][2])
+        self.assertIn("预测", messages[0][2])
+        self.assertIn("风险", messages[0][2])
         self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
-        manager.dispatch_outbox()
-        self.assertEqual(len(notifier.messages), 1)
+        self.assertEqual(len(self.stored_messages("daily_summary")), 1)
 
     def test_empty_daily_check_prevents_later_same_day_summary(self):
         manager = self.manager([0.70])
@@ -554,6 +497,45 @@ alerts:
         self.storage.add_rule(1579, "umo:a", "ratio", 72)
         manager.run_cycle(max_workers=1)
         self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
+
+    def test_daily_summary_skips_active_rule_when_latest_source_is_stale(self):
+        manager = self.manager([0.70])
+        rule = self.storage.add_rule(1579, "umo:a", "ratio", 72)
+        manager.run_cycle(max_workers=1)
+        self.assertEqual(
+            self.storage.get_rule_state(int(rule["id"]))["alert_active"],
+            1,
+        )
+        with self.storage.connect() as connection:
+            connection.execute(
+                "UPDATE market_snapshots SET source_updated_at=? WHERE kind='current'",
+                (
+                    (
+                        datetime.now(timezone.utc) - timedelta(hours=1)
+                    ).isoformat(),
+                ),
+            )
+
+        self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 26)), 0)
+        self.assertEqual(self.stored_messages("daily_summary"), [])
+
+    def test_corrupt_cache_does_not_block_items_or_daily_summary(self):
+        manager = self.manager([0.70])
+        self.storage.add_rule(1579, "umo:a", "ratio", 72)
+        manager.run_cycle(max_workers=1)
+        with self.storage.connect() as connection:
+            connection.execute(
+                "UPDATE market_snapshots SET source_updated_at='broken' "
+                "WHERE kind='current'"
+            )
+
+        items = manager.list_items("umo:a")
+        queued = manager.enqueue_daily_summary(date(2026, 7, 27))
+
+        self.assertEqual(len(items), 1)
+        self.assertIsNone(items[0]["latest"])
+        self.assertEqual(queued, 0)
+        self.assertEqual(self.stored_messages("daily_summary"), [])
 
     def test_daily_summary_excludes_recovery_band_and_missing_values(self):
         manager = self.manager()
@@ -568,83 +550,6 @@ alerts:
 
         self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
 
-    @unittest.skip("由纯插件异步运行时测试覆盖")
-    def test_runtime_daily_summary_is_independent_of_poll_cycle(self):
-        notifier = FakeNotifier()
-        manager = self.manager([0.70], notifier)
-        self.storage.add_rule(1579, "umo:a", "ratio", 72)
-        runtime = ServiceRuntime(
-            manager, backup_dir=Path(self.tmp.name) / "backups",
-            daily_summary_time="09:00",
-        )
-
-        runtime.run_once(datetime(2026, 7, 25, 0, 30, tzinfo=timezone.utc))
-        notifier.messages.clear()
-        runtime.run_once(datetime(2026, 7, 25, 1, 0, tzinfo=timezone.utc))
-
-        self.assertEqual(len(notifier.messages), 0)
-
-        result = runtime.run_daily_summary(
-            datetime(2026, 7, 25, 1, 0, tzinfo=timezone.utc)
-        )
-
-        self.assertEqual(len(notifier.messages), 1)
-        self.assertIn("每日交易告警汇总", notifier.messages[0][1])
-        self.assertEqual(result, {"queued": 1, "sent": 1, "failed": 0})
-        self.assertTrue(runtime.last_daily_summary_ok)
-
-    @unittest.skip("由纯插件异步运行时测试覆盖")
-    def test_runtime_daily_scheduler_targets_beijing_nine_and_catches_up(self):
-        runtime = ServiceRuntime(
-            self.manager(), backup_dir=Path(self.tmp.name) / "backups",
-            daily_summary_time="09:00",
-        )
-
-        before = datetime(2026, 7, 25, 0, 59, tzinfo=timezone.utc)
-        target = runtime._next_daily_summary_target(before)
-        self.assertEqual(target.astimezone(timezone.utc), datetime(
-            2026, 7, 25, 1, 0, tzinfo=timezone.utc
-        ))
-
-        after = datetime(2026, 7, 25, 1, 26, tzinfo=timezone.utc)
-        catch_up = runtime._next_daily_summary_target(after)
-        self.assertEqual(catch_up, after.astimezone(runtime.local_timezone))
-
-        self.storage.set_metadata("daily_summary:last_date", "2026-07-25")
-        next_day = runtime._next_daily_summary_target(after)
-        self.assertEqual(next_day.astimezone(timezone.utc), datetime(
-            2026, 7, 26, 1, 0, tzinfo=timezone.utc
-        ))
-
-    @unittest.skip("由纯插件异步运行时测试覆盖")
-    def test_runtime_starts_and_stops_both_schedulers(self):
-        runtime = ServiceRuntime(
-            self.manager(), interval_seconds=3600,
-            backup_dir=Path(self.tmp.name) / "backups",
-            daily_summary_time="23:59",
-        )
-
-        runtime.start()
-        try:
-            status = runtime.status()
-            self.assertTrue(status["running"])
-            self.assertTrue(status["daily_summary_running"])
-        finally:
-            runtime.stop()
-
-        self.assertFalse(runtime.thread.is_alive())
-        self.assertFalse(runtime.summary_thread.is_alive())
-
-    @unittest.skip("由纯插件配置和异步运行时测试覆盖")
-    def test_breakthrough_step_and_daily_time_are_validated(self):
-        with self.assertRaisesRegex(ValueError, "突破档位步长"):
-            MonitoringManager(
-                self.storage, FakeSource(), FakeNotifier(),
-                breakthrough_step_percent=0,
-            )
-        with self.assertRaisesRegex(ValueError, "HH:MM"):
-            ServiceRuntime(self.manager(), daily_summary_time="9am")
-
     def test_lowest_platform_ignores_liquidity(self):
         value = snapshot()
         value = MarketSnapshot(**{
@@ -656,10 +561,7 @@ alerts:
         self.assertEqual(value.calculated_ratio, round(3.10 / value.steam_net, 4))
 
     def test_t7_rule_uses_displayed_dynamic_forecast_ratio(self):
-        notifier = FakeNotifier()
-        manager = MonitoringManager(
-            self.storage, ForecastHistorySource([0.70]), notifier
-        )
+        manager = MonitoringManager(self.storage, ForecastHistorySource([0.70]))
         rule = manager.add_rule("umo:a", 1579, "t7", 72)
         manager.run_cycle(max_workers=1)
         state = self.storage.get_rule_state(rule["id"])
@@ -673,13 +575,13 @@ alerts:
             state["last_baseline"], quote["forecast"]["predicted_steam_net"]
         )
         self.assertEqual(state["alert_active"], 1)
-        self.assertEqual(len(notifier.messages), 1)
-        self.assertIn("T+7预测挂刀", notifier.messages[0][1])
-        self.assertIn("七日预测比例", notifier.messages[0][2])
+        messages = self.stored_messages()
+        self.assertEqual(len(messages), 1)
+        self.assertIn("T+7预测挂刀", messages[0][1])
+        self.assertIn("七日预测比例", messages[0][2])
 
     def test_t7_rule_waits_when_dynamic_forecast_is_unavailable(self):
-        notifier = FakeNotifier()
-        manager = self.manager([0.70], notifier)
+        manager = self.manager([0.70])
         rule = manager.add_rule("umo:a", 1579, "t7", 72)
 
         manager.run_cycle(max_workers=1)
@@ -687,169 +589,110 @@ alerts:
         state = self.storage.get_rule_state(rule["id"])
         self.assertIsNone(state["last_value"])
         self.assertIn("七日预测不可用", state["status"])
-        self.assertEqual(notifier.messages, [])
+        self.assertEqual(self.stored_messages(), [])
+
+    def test_stale_poll_history_cannot_make_t7_forecast_ready(self):
+        now = datetime.now(timezone.utc)
+        stale_rows = []
+        for index in range(1, 30 * 12 + 1):
+            observed = now - timedelta(hours=index * 2)
+            value = snapshot(0.70)
+            stale_rows.append(MarketSnapshot(**{
+                **value.__dict__,
+                "observed_at": observed,
+                "source_updated_at": observed - timedelta(hours=2),
+            }))
+        self.storage.save_snapshots(stale_rows)
+        manager = self.manager([0.70])
+        rule = self.storage.add_rule(1579, "umo:a", "t7", 100)
+
+        manager.run_cycle(max_workers=1)
+
+        state = self.storage.get_rule_state(int(rule["id"]))
+        quote = manager.quote("1579")
+        self.assertEqual(manager.source.history_calls, 1)
+        self.assertNotEqual(quote["forecast"]["status"], "ready")
+        self.assertIsNone(state["last_value"])
+        self.assertEqual(self.stored_messages(), [])
 
     def test_platform_and_steam_rules_trigger_without_volume(self):
-        notifier = FakeNotifier()
-        manager = self.manager([0.70, 0.70], notifier)
+        manager = self.manager([0.70, 0.70])
         self.storage.add_rule(1579, "umo:a", "platform", 3.30)
         self.storage.add_rule(1579, "umo:a", "steam", 5.30)
         manager.run_cycle(max_workers=1)
         manager.run_cycle(max_workers=1)
-        self.assertEqual({message[1].split("】", 1)[0] + "】" for message in notifier.messages}, {
+        self.assertEqual({message[1].split("】", 1)[0] + "】" for message in self.stored_messages()}, {
             "【平台到价】", "【Steam清仓】",
         })
 
-    def test_outbox_failure_isolated_by_umo(self):
-        notifier = FakeNotifier(failing_umo="umo:b")
-        manager = self.manager(notifier=notifier)
-        self.storage.enqueue_notification(
-            "sig:a", "umo:a", "test", "title", "body", driver="fake"
-        )
-        self.storage.enqueue_notification(
-            "sig:b", "umo:b", "test", "title", "body", driver="fake"
-        )
-        result = manager.dispatch_outbox()
-        self.assertEqual(result, {"sent": 1, "failed": 1})
-        self.assertEqual(self.storage.outbox_counts(), {"pending": 1, "sent": 1})
-
-    def test_concurrent_outbox_dispatch_sends_each_job_once(self):
-        entered = threading.Event()
-        release = threading.Event()
-
-        class BlockingNotifier(FakeNotifier):
-            def send_to(self, umo, title, content):
-                entered.set()
-                release.wait(timeout=2)
-                return super().send_to(umo, title, content)
-
-        notifier = BlockingNotifier()
-        manager = self.manager(notifier=notifier)
-        self.storage.enqueue_notification(
-            "concurrent:1", "umo:a", "test", "title", "content",
-            driver=notifier.name,
-        )
-        results = []
-        first = threading.Thread(target=lambda: results.append(manager.dispatch_outbox()))
-        second = threading.Thread(target=lambda: results.append(manager.dispatch_outbox()))
-
-        first.start()
-        self.assertTrue(entered.wait(timeout=2))
-        second.start()
-        release.set()
-        first.join(timeout=2)
-        second.join(timeout=2)
-
-        self.assertFalse(first.is_alive())
-        self.assertFalse(second.is_alive())
-        self.assertEqual(len(notifier.messages), 1)
-        self.assertEqual(sum(result["sent"] for result in results), 1)
-
-    def test_stale_source_time_does_not_trigger_health_failure(self):
-        notifier = FakeNotifier()
-        manager = MonitoringManager(self.storage, StaleSource([0.70]), notifier)
+    def test_stale_source_time_skips_trade_alert_without_health_failure(self):
+        manager = MonitoringManager(self.storage, StaleSource([0.70]))
         self.storage.add_rule(1579, "umo:a", "ratio", 72)
         for _ in range(3):
             manager.run_cycle(max_workers=1)
-        self.assertEqual(len(notifier.messages), 1)
-        self.assertIn("即时挂刀", notifier.messages[0][1])
+        messages = self.stored_messages()
+        self.assertEqual(messages, [])
         state = self.storage.get_health_state(1579, "umo:a")
         self.assertEqual(state["fetch_failures"], 0)
         self.assertEqual(state["health_alerted"], 0)
+        rule = self.storage.list_rules(recipient_key="umo:a")[0]
+        rule_state = self.storage.get_rule_state(int(rule["id"]))
+        self.assertIsNone(rule_state["last_value"])
+        self.assertEqual(rule_state["status"], "行情数据已过期")
+
+        quote = manager.quote("1579")
+        self.assertTrue(quote["cached"])
+        self.assertTrue(quote["stale"])
+        self.assertNotEqual(quote["forecast"]["status"], "ready")
+        self.assertNotEqual(quote["risk_assessment"]["status"], "ready")
+
+    def test_future_source_time_is_invalid_and_cannot_trigger_trade_alert(self):
+        manager = MonitoringManager(self.storage, FutureSource([0.70]))
+        rule = self.storage.add_rule(1579, "umo:a", "ratio", 72)
+
+        result = manager.run_cycle(max_workers=1)
+
+        self.assertTrue(result[0]["stale"])
+        self.assertEqual(self.stored_messages(), [])
+        state = self.storage.get_rule_state(int(rule["id"]))
+        self.assertIsNone(state["last_value"])
+        self.assertEqual(state["status"], "行情数据已过期")
+        history = self.storage.steam_history(
+            ITEM["item_key"],
+            days=7,
+            max_current_lag_seconds=manager.poll_interval_seconds,
+        )
+        future_limit = datetime.now(timezone.utc) + timedelta(minutes=5)
+        self.assertTrue(all(
+            datetime.fromisoformat(row["source_updated_at"]) <= future_limit
+            for row in history
+        ))
+
+    def test_corrupt_cached_timestamp_falls_through_to_upstream(self):
+        manager = self.manager([0.70])
+        self.storage.save_snapshots([snapshot(0.71)])
+        with self.storage.connect() as connection:
+            connection.execute(
+                "UPDATE market_snapshots SET source_updated_at='broken' "
+                "WHERE kind='current'"
+            )
+
+        quote = manager.quote("1579")
+        cached = manager.quote("1579")
+
+        self.assertEqual(manager.source.current_calls, 1)
+        self.assertFalse(quote["cached"])
+        self.assertFalse(quote["stale"])
+        self.assertTrue(cached["cached"])
 
     def test_three_real_request_failures_trigger_health_alert(self):
-        notifier = FakeNotifier()
-        manager = self.manager([RuntimeError("down")] * 3, notifier)
+        manager = self.manager([RuntimeError("down")] * 3)
         self.storage.add_rule(1579, "umo:a", "ratio", 72)
         for _ in range(3):
             manager.run_cycle(max_workers=1)
-        self.assertEqual(len(notifier.messages), 1)
-        self.assertIn("监控异常", notifier.messages[0][1])
-
-    @unittest.skip("独立 FastAPI 服务不属于纯插件")
-    def test_api_auth_crud_and_validation_envelope(self):
-        manager = self.manager([0.70])
-        app = create_app(manager=manager, runtime=FakeRuntime(), service_token="secret")
-        with TestClient(app) as client:
-            self.assertEqual(client.get("/v2/monitor/items").status_code, 401)
-            headers = {"Authorization": "Bearer secret"}
-            search_response = client.get(
-                "/v2/market/search", headers=headers, params={"q": "裂空"}
-            )
-            self.assertEqual(search_response.status_code, 200)
-            self.assertEqual(search_response.json()["data"][0]["smis_id"], 1579)
-            response = client.post("/v2/rules", headers=headers, json={
-                "recipient_key": "astrQQ:FriendMessage:test", "smis_id": 1579,
-                "rule_type": "ratio", "threshold": 72,
-            })
-            self.assertEqual(response.status_code, 200, response.text)
-            rule_id = response.json()["data"]["id"]
-            listed = client.get(
-                "/v2/rules", headers=headers,
-                params={"recipient_key": "astrQQ:FriendMessage:test"},
-            )
-            self.assertEqual(listed.json()["data"][0]["rule_type"], "ratio")
-            self.assertIn(
-                "highest_notified_level", listed.json()["data"][0]["state"]
-            )
-            quote_response = client.get(
-                "/v2/market/quote", headers=headers, params={"q": "1579"}
-            )
-            self.assertTrue(quote_response.json()["ok"])
-            quote_data = quote_response.json()["data"]
-            self.assertIn("forecast", quote_data)
-            self.assertIn("risk_assessment", quote_data)
-            self.assertNotIn("risk_prediction", quote_data)
-            bad = client.patch(f"/v2/rules/{rule_id}", headers=headers, json={
-                "recipient_key": "astrQQ:FriendMessage:test", "threshold": 0,
-            })
-            self.assertEqual(bad.status_code, 422)
-            self.assertEqual(bad.json()["error"]["code"], "validation_error")
-
-    @unittest.skip("独立 FastAPI 服务不属于纯插件")
-    def test_event_api_persists_and_acknowledges_without_astrbot(self):
-        manager = self.manager()
-        app = create_app(manager=manager, runtime=FakeRuntime(), service_token="secret")
-        headers = {"Authorization": "Bearer secret"}
-        recipient = "standalone:local"
-        with TestClient(app) as client:
-            created = client.post(
-                "/v2/events/test", headers=headers, json={"recipient_key": recipient}
-            )
-            self.assertEqual(created.status_code, 200, created.text)
-            event_id = created.json()["data"]["id"]
-            listed = client.get(
-                "/v2/events", headers=headers,
-                params={"recipient_key": recipient, "acknowledged": "false"},
-            )
-            self.assertEqual([row["id"] for row in listed.json()["data"]], [event_id])
-            acknowledged = client.post(
-                f"/v2/events/{event_id}/ack", headers=headers,
-                json={"recipient_key": recipient},
-            )
-            self.assertIsNotNone(acknowledged.json()["data"]["acknowledged_at"])
-            empty = client.get(
-                "/v2/events", headers=headers,
-                params={"recipient_key": recipient, "acknowledged": "false"},
-            )
-            self.assertEqual(empty.json()["data"], [])
-
-    @unittest.skip("独立 FastAPI 服务不属于纯插件")
-    def test_market_history_api_is_independent_of_recipient(self):
-        manager = self.manager()
-        app = create_app(manager=manager, runtime=FakeRuntime(), service_token="secret")
-        with TestClient(app) as client:
-            response = client.get(
-                "/v2/market/history",
-                headers={"Authorization": "Bearer secret"},
-                params={"q": "1579", "days": 7},
-            )
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["data"]["smis_id"], 1579)
-        self.assertEqual(len(response.json()["data"]["points"]), 13)
-        with self.storage.connect() as connection:
-            count = connection.execute("SELECT COUNT(*) FROM market_snapshots").fetchone()[0]
-        self.assertEqual(count, 0)
+        messages = self.stored_messages()
+        self.assertEqual(len(messages), 1)
+        self.assertIn("监控异常", messages[0][1])
 
     def test_snapshot_pruning_keeps_only_rolling_eight_days(self):
         old = snapshot(0.70, -(9 * 86400))
@@ -866,10 +709,26 @@ alerts:
     def test_history_backfill_only_runs_when_local_coverage_is_insufficient(self):
         manager = self.manager()
         item = dict(ITEM)
-        manager._ensure_history(item)
+        manager.history_backfiller.ensure_history(item)
         self.assertEqual(manager.source.history_calls, 1)
         self.assertEqual(manager.source.history_days, [30])
-        manager._ensure_history(item)
+        manager.history_backfiller.ensure_history(item)
+        self.assertEqual(manager.source.history_calls, 1)
+
+    def test_sparse_cache_and_legacy_done_marker_still_retry_upstream(self):
+        manager = self.manager()
+        old = snapshot(0.70, -(30 * 86400))
+        self.storage.save_snapshots([
+            MarketSnapshot(**{**old.__dict__, "kind": "history"})
+        ])
+        key = f"history-bootstrap:{ITEM['item_key']}:30"
+        self.storage.set_metadata(key, "done")
+
+        result = manager.history_backfiller.ensure_history(dict(ITEM))
+        second = manager.history_backfiller.ensure_history(dict(ITEM))
+
+        self.assertTrue(result)
+        self.assertIsNone(second)
         self.assertEqual(manager.source.history_calls, 1)
 
     def test_unchanged_market_after_observation_gap_does_not_backfill(self):
@@ -885,7 +744,9 @@ alerts:
             "source_updated_at": old.source_updated_at.isoformat(),
         }
 
-        manager._backfill_changed_gap(dict(ITEM), previous, current, [])
+        manager.history_backfiller.backfill_changed_gap(
+            dict(ITEM), previous, current, []
+        )
 
         self.assertEqual(manager.source.history_calls, 0)
 
@@ -904,7 +765,9 @@ alerts:
                 **current.__dict__,
                 "observed_at": now,
             })
-            manager._backfill_changed_gap(dict(ITEM), previous, current, [])
+            manager.history_backfiller.backfill_changed_gap(
+                dict(ITEM), previous, current, []
+            )
             self.assertEqual(manager.source.history_days[-1], expected_days)
 
         self.assertEqual(manager.source.history_days, [1, 2])
@@ -919,7 +782,7 @@ alerts:
                 return []
 
         source = FailOnceHistorySource()
-        manager = MonitoringManager(self.storage, source, FakeNotifier())
+        manager = MonitoringManager(self.storage, source)
         now = datetime.now(timezone.utc)
         old = snapshot(0.70, -(25 * 3600))
         previous = {
@@ -933,8 +796,12 @@ alerts:
         })
 
         with self.assertRaisesRegex(RuntimeError, "temporary"):
-            manager._backfill_changed_gap(dict(ITEM), previous, current, [])
-        manager._backfill_changed_gap(dict(ITEM), previous, current, [])
+            manager.history_backfiller.backfill_changed_gap(
+                dict(ITEM), previous, current, []
+            )
+        manager.history_backfiller.backfill_changed_gap(
+            dict(ITEM), previous, current, []
+        )
         self.assertEqual(source.history_calls, 1)
 
         pending_key = f"history-gap-pending:{ITEM['item_key']}"
@@ -943,7 +810,9 @@ alerts:
             datetime.now(timezone.utc) - timedelta(hours=6, minutes=1)
         ).isoformat()
         self.storage.set_metadata(pending_key, json.dumps(pending))
-        manager._backfill_changed_gap(dict(ITEM), previous, current, [])
+        manager.history_backfiller.backfill_changed_gap(
+            dict(ITEM), previous, current, []
+        )
 
         self.assertEqual(source.history_days, [2, 2])
         self.assertEqual(self.storage.get_metadata(pending_key), "")
@@ -1005,28 +874,6 @@ alerts:
         manager = self.manager()
         manager.remove_rule("umo:a", rule["id"])
         self.assertIsNone(self.storage.get_item(1579))
-
-
-@unittest.skip("AstrBot OpenAPI 回调已由进程内主动消息取代")
-class AstrBotNotifierTestCase(unittest.TestCase):
-    def test_sends_expected_openapi_payload(self):
-        from unittest.mock import Mock
-
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"status": "ok", "data": {}}
-        session = Mock()
-        session.post.return_value = response
-        notifier = AstrBotNotifier(
-            "http://astrbot:6185", "abk_test", session=session
-        )
-        result = notifier.send_to("astrQQ:FriendMessage:test", "标题", "正文")
-        self.assertTrue(result.success)
-        call = session.post.call_args
-        self.assertEqual(call.kwargs["headers"], {"X-API-Key": "abk_test"})
-        self.assertEqual(call.kwargs["json"], {
-            "umo": "astrQQ:FriendMessage:test", "message": "标题\n正文",
-        })
 
 
 if __name__ == "__main__":

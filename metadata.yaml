@@ -1,7 +1,7 @@
 name: astrbot_plugin_steam_skin_ops
 display_name: Steam Skin Ops 饰品监控
 author: hitazuki
-version: "1.0.0"
+version: "1.1.0"
 desc: 在 AstrBot 内直接查询 Steam 饰品行情，配置挂刀、T+7 与清仓监控规则并主动推送告警。
 short_desc: Steam 饰品行情、风险评估与按会话监控
 repo: "https://github.com/hitazuki/astrbot_plugin_steam_skin_ops"

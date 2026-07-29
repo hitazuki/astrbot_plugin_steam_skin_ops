@@ -8,6 +8,7 @@ from core.risk import (
     canonical_two_hour_rows,
     forecast_and_risk,
     forecast_seven_days,
+    has_usable_history_coverage,
 )
 
 NOW = datetime(2026, 7, 26, 22, tzinfo=timezone.utc)
@@ -146,6 +147,42 @@ class ForecastSelectionTestCase(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "current")
         self.assertEqual(rows[0]["steam_sell_price"], 10.0)
+
+    def test_stale_current_observations_do_not_fill_forecast_coverage(self):
+        rows = series_rows([10.0] * 30)
+        for row in rows:
+            row["source_updated_at"] = (
+                datetime.fromisoformat(row["observed_at"]) - timedelta(hours=2)
+            ).isoformat()
+        current = make_snapshot(NOW, 10.0)
+
+        forecast, grid, _ = forecast_seven_days(
+            rows,
+            current,
+            now=NOW,
+            max_current_lag_seconds=1800,
+        )
+
+        self.assertEqual(grid, [])
+        self.assertEqual(forecast["status"], "insufficient_history")
+
+    def test_dense_fresh_history_is_usable_but_future_source_times_are_not(self):
+        fresh = series_rows([10.0] * 30)
+        self.assertTrue(has_usable_history_coverage(
+            fresh,
+            now=NOW,
+            max_current_lag_seconds=1800,
+        ))
+        for row in fresh:
+            row["source_updated_at"] = (
+                datetime.fromisoformat(row["observed_at"]) + timedelta(days=2)
+            ).isoformat()
+
+        self.assertFalse(has_usable_history_coverage(
+            fresh,
+            now=NOW,
+            max_current_lag_seconds=1800,
+        ))
 
 
 class RiskDimensionTestCase(unittest.TestCase):

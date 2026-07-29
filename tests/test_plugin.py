@@ -198,6 +198,61 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(plugin.manager.storage.outbox_counts()["pending"], 1)
             await plugin.terminate()
 
+    async def test_concurrent_outbox_dispatch_sends_each_job_once(self):
+        with TemporaryDirectory() as tmp:
+            module = load_plugin(Path(tmp))
+            context = FakeContext()
+            plugin = module.SteamSkinOpsPlugin(context, {"enabled": False})
+            plugin.manager.storage.enqueue_notification(
+                "concurrent:one",
+                "test:FriendMessage:1",
+                "test",
+                "标题",
+                "正文",
+                driver="astrbot",
+            )
+
+            results = await asyncio.gather(
+                plugin._dispatch_outbox(),
+                plugin._dispatch_outbox(),
+            )
+
+            self.assertEqual(len(context.messages), 1)
+            self.assertEqual(sum(result["sent"] for result in results), 1)
+            self.assertEqual(plugin.manager.storage.outbox_counts()["sent"], 1)
+            await plugin.terminate()
+
+    async def test_rule_list_keeps_quarantined_invalid_threshold_visible(self):
+        with TemporaryDirectory() as tmp:
+            module = load_plugin(Path(tmp))
+            plugin = module.SteamSkinOpsPlugin(FakeContext(), {"enabled": False})
+            plugin.manager.storage.upsert_item({
+                "smis_id": 1579,
+                "item_key": "smis:1579",
+                "appid": 730,
+                "name": "Fracture Case",
+                "name_zh": "裂空武器箱",
+            })
+            rule = plugin.manager.storage.add_rule(
+                1579,
+                FakeEvent.unified_msg_origin,
+                "platform",
+                4.0,
+            )
+            with plugin.manager.storage.connect() as connection:
+                connection.execute(
+                    "UPDATE rules SET threshold='broken' WHERE id=?",
+                    (int(rule["id"]),),
+                )
+            plugin.manager._audit_rule_configurations()
+
+            results = [value async for value in plugin.rule_list(FakeEvent())]
+
+            self.assertIn("已隔离", results[0])
+            self.assertIn("无效阈值", results[0])
+            self.assertNotIn("查询失败", results[0])
+            await plugin.terminate()
+
     def test_command_contract_and_admin_permissions_are_present(self):
         source = (ROOT / "main.py").read_text(encoding="utf-8")
         for command in (

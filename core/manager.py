@@ -1,24 +1,48 @@
 from __future__ import annotations
 
-import json
 import logging
 import math
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta, timezone
-from hashlib import sha1
-from pathlib import Path
+from dataclasses import asdict
+from datetime import date, datetime, timezone
 from urllib.parse import quote
 
-from .history import t7_stats
+from .alerting import evaluate_rule_transition
+from .history import seven_day_history_stats
+from .history_backfill import HistoryBackfiller
 from .integrations.smis import MarketDataProvider
-from .market import MarketSnapshot
-from .repository import MonitorStorage
-from .risk import forecast_and_risk, snapshot_fingerprint
-from .rules import rule_value, validate_rule
+from .market import MAX_SOURCE_FUTURE_SKEW_SECONDS, MarketSnapshot
+from .presentation import (
+    daily_analysis_suffix,
+    format_breakthrough_alert,
+    format_rule_alert,
+)
+from .repository import MonitorStorage, RuleItemLimitError
+from .risk import forecast_and_risk
+from .rules import (
+    MAX_RULE_STATE_INTEGER,
+    RuleMeasurement,
+    get_rule_definition,
+    measure_rule,
+    parse_rule_state_integer,
+    validate_rule,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _positive_finite(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _state_count(value: object) -> int:
+    return parse_rule_state_integer(value) or 0
 
 
 class ServiceError(RuntimeError):
@@ -45,7 +69,6 @@ class MonitoringManager:
         self,
         storage: MonitorStorage,
         source: MarketDataProvider,
-        notifier=None,
         *,
         delivery_driver: str = "astrbot",
         max_items: int = 20,
@@ -58,30 +81,102 @@ class MonitoringManager:
     ) -> None:
         self.storage = storage
         self.source = source
-        self.notifier = notifier
-        self.delivery_driver = getattr(notifier, "name", delivery_driver)
+        self.delivery_driver = delivery_driver
         self.max_items = max_items
         self.quote_cache_seconds = quote_cache_seconds
-        self.confirmations = confirmations
-        self.clear_confirmations = clear_confirmations
-        self.health_failure_threshold = health_failure_threshold
+        self.confirmations = max(1, int(confirmations))
+        self.clear_confirmations = max(1, int(clear_confirmations))
+        self.health_failure_threshold = max(1, int(health_failure_threshold))
         self.poll_interval_seconds = max(1, int(poll_interval_seconds))
+        self.history_backfiller = HistoryBackfiller(
+            storage,
+            source,
+            poll_interval_seconds=self.poll_interval_seconds,
+        )
         if not math.isfinite(breakthrough_step_percent) or breakthrough_step_percent <= 0:
             raise ValueError("突破档位步长必须大于 0")
         self.breakthrough_step = float(breakthrough_step_percent) / 100
         self._locks_guard = threading.Lock()
         self._item_locks: dict[int, threading.Lock] = {}
-        self._dispatch_lock = threading.Lock()
+        self._audit_rule_configurations()
+        self._audit_rule_states()
         self._sync_t7_rule_basis()
         self._sync_breakthrough_behavior()
         self._sync_breakthrough_step()
+
+    @staticmethod
+    def _rule_configuration_error(rule_type: str, threshold: object) -> str | None:
+        if get_rule_definition(rule_type) is None:
+            return f"不支持的规则类型：{rule_type}"
+        validation = validate_rule(rule_type, threshold)
+        return f"规则配置无效：{validation[1]}" if validation else None
+
+    def _quarantine_rule(self, rule: dict, status: str) -> None:
+        rule_id = int(rule["id"])
+        recipient_key = str(rule["recipient_key"])
+        self.storage.cancel_pending_rule_notifications(rule_id, recipient_key)
+        self.storage.update_rule_state(
+            rule_id,
+            alert_active=0,
+            qualifying_count=0,
+            clearing_count=0,
+            last_value=None,
+            last_baseline=None,
+            highest_notified_level=0,
+            status=status,
+        )
+        self.storage.set_rule_operational(rule_id, recipient_key, False)
+
+    def _audit_rule_configurations(self) -> None:
+        for rule in self.storage.list_rules():
+            operational = parse_rule_state_integer(rule.get("operational"))
+            if operational not in {0, 1}:
+                self._quarantine_rule(rule, "规则运行状态无效")
+                continue
+            status = self._rule_configuration_error(
+                str(rule["rule_type"]),
+                rule["threshold"],
+            )
+            if status is not None:
+                self._quarantine_rule(rule, status)
+
+    def _audit_rule_states(self) -> None:
+        integer_fields = (
+            "alert_active",
+            "qualifying_count",
+            "clearing_count",
+            "highest_notified_level",
+        )
+        for rule in self.storage.list_rules():
+            state = self.storage.get_rule_state(int(rule["id"]))
+            integers = {
+                key: parse_rule_state_integer(state.get(key, 0))
+                for key in integer_fields
+            }
+            if any(value is None for value in integers.values()):
+                self._quarantine_rule(rule, "规则状态无效")
+                continue
+            if (
+                integers["alert_active"] not in {0, 1}
+            ):
+                self._quarantine_rule(rule, "规则状态无效")
+                continue
+            numeric_values = (
+                state.get("last_value"),
+                state.get("last_baseline"),
+            )
+            if any(
+                value is not None and _positive_finite(value) is None
+                for value in numeric_values
+            ):
+                self._quarantine_rule(rule, "测量值无效")
 
     def _sync_t7_rule_basis(self) -> None:
         key = "alerting:t7_basis"
         value = "seven_day_dynamic_forecast:v1"
         if self.storage.get_metadata(key) == value:
             return
-        self.storage.reset_rule_states("t7")
+        self.storage.reset_rule_states("t7", operational_only=True)
         self.storage.set_metadata(key, value)
 
     def _sync_breakthrough_behavior(self) -> None:
@@ -94,17 +189,43 @@ class MonitoringManager:
 
     def _recalculate_active_breakthrough_levels(self) -> None:
         """Store the current active level in the legacy highest-level column."""
-        for rule in self.storage.list_rules():
+        for rule in self.storage.list_rules(operational_only=True):
             state = self.storage.get_rule_state(int(rule["id"]))
             current = state.get("last_value")
-            if not state.get("alert_active") or current is None:
+            if not _state_count(state.get("alert_active")) or current is None:
                 continue
             rule_type = str(rule["rule_type"])
+            definition = get_rule_definition(rule_type)
+            status = self._rule_configuration_error(rule_type, rule["threshold"])
+            if definition is None or status is not None:
+                self._quarantine_rule(
+                    rule,
+                    status or f"不支持的规则类型：{rule_type}",
+                )
+                continue
+            current_value = _positive_finite(current)
+            if current_value is None:
+                self._quarantine_rule(rule, "测量值无效")
+                continue
             threshold = float(rule["threshold"])
-            limit = threshold / 100 if rule_type in {"ratio", "t7"} else threshold
-            level, _ = self._breakthrough_level(rule_type, limit, float(current))
+            limit = definition.limit(threshold)
+            try:
+                level, _ = definition.breakthrough(
+                    current_value,
+                    limit,
+                    self.breakthrough_step,
+                )
+            except (ArithmeticError, TypeError, ValueError):
+                self._quarantine_rule(rule, "测量值无效")
+                continue
             self.storage.update_rule_state(
-                int(rule["id"]), highest_notified_level=level
+                int(rule["id"]),
+                alert_active=1,
+                qualifying_count=_state_count(state.get("qualifying_count")),
+                clearing_count=_state_count(state.get("clearing_count")),
+                last_value=current_value,
+                last_baseline=_positive_finite(state.get("last_baseline")),
+                highest_notified_level=level,
             )
 
     def _sync_breakthrough_step(self) -> None:
@@ -119,14 +240,26 @@ class MonitoringManager:
         with self._locks_guard:
             return self._item_locks.setdefault(int(smis_id), threading.Lock())
 
-    def list_items(self) -> list[dict]:
+    def list_items(self, recipient_key: str) -> list[dict]:
         result = []
-        active_ids = {int(rule["smis_id"]) for rule in self.storage.list_rules()}
+        active_ids = {
+            int(rule["smis_id"])
+            for rule in self.storage.list_rules(recipient_key=recipient_key)
+        }
         for item in self.storage.list_items():
             if int(item["smis_id"]) not in active_ids:
                 continue
             latest = self.storage.latest_snapshot(item["item_key"])
-            result.append({**item, "latest": self._snapshot_row_to_dict(latest) if latest else None})
+            try:
+                latest_payload = self._snapshot_row_to_dict(latest) if latest else None
+            except Exception as exc:
+                logger.warning(
+                    "忽略损坏的饰品缓存 smis_id=%s: %s",
+                    item["smis_id"],
+                    exc,
+                )
+                latest_payload = None
+            result.append({**item, "latest": latest_payload})
         return result
 
     def search_items(self, query: str, limit: int = 10) -> list[dict]:
@@ -154,7 +287,7 @@ class MonitoringManager:
         rule_type = rule_type.strip().lower()
         self._validate_rule(rule_type, threshold)
         if (
-            not self.storage.list_rules(smis_id=smis_id)
+            not self.storage.list_rules(smis_id=smis_id, operational_only=True)
             and self.storage.count_rule_items() >= self.max_items
         ):
             raise ServiceError(409, "item_limit", f"最多只能监控 {self.max_items} 个饰品")
@@ -165,9 +298,23 @@ class MonitoringManager:
             except Exception as exc:
                 raise ServiceError(503, "source_unavailable", f"SMIS 饰品信息获取失败：{exc}") from exc
             item = self.storage.upsert_item(metadata)
-        rule = self.storage.add_rule(smis_id, recipient_key, rule_type, threshold)
         try:
-            self._ensure_history(item_from_row(item))
+            rule = self.storage.add_rule(
+                smis_id,
+                recipient_key,
+                rule_type,
+                threshold,
+                max_items=self.max_items,
+            )
+        except RuleItemLimitError as exc:
+            self.storage.delete_item_if_unreferenced(smis_id)
+            raise ServiceError(
+                409,
+                "item_limit",
+                f"最多只能监控 {self.max_items} 个饰品",
+            ) from exc
+        try:
+            self.history_backfiller.ensure_history(item_from_row(item))
         except Exception as exc:
             logger.warning("规则历史回填失败 smis_id=%s: %s", smis_id, exc)
         rule["state"] = self.storage.get_rule_state(rule["id"])
@@ -178,7 +325,19 @@ class MonitoringManager:
         if not rule or str(rule["recipient_key"]) != recipient_key:
             raise ServiceError(404, "rule_not_found", "当前会话未找到该规则")
         self._validate_rule(str(rule["rule_type"]), threshold)
-        return self.storage.update_rule(rule_id, recipient_key, threshold)
+        try:
+            return self.storage.update_rule(
+                rule_id,
+                recipient_key,
+                threshold,
+                max_items=self.max_items,
+            )
+        except RuleItemLimitError as exc:
+            raise ServiceError(
+                409,
+                "item_limit",
+                f"最多只能监控 {self.max_items} 个饰品",
+            ) from exc
 
     def remove_rule(self, recipient_key: str, rule_id: int) -> None:
         if not self.storage.delete_rule(rule_id, recipient_key):
@@ -198,17 +357,42 @@ class MonitoringManager:
             return exact[0]
         return None
 
+    def _market_candidates(self, query: str) -> list[dict]:
+        matches = self.search_items(query, limit=10)
+        exact = [
+            row for row in matches
+            if str(row.get("name_zh") or "").casefold() == query.casefold()
+        ]
+        return exact if exact else matches
+
+    def resolve_smis_id(self, query: str) -> int:
+        """Resolve command input through the same catalog matching policy as quotes."""
+
+        target = query.strip()
+        if target.isdigit():
+            return int(target)
+        candidates = self._market_candidates(target)
+        if not candidates:
+            raise ServiceError(
+                404,
+                "item_not_found",
+                "SMIS 未找到匹配饰品，请先使用 /skin search。",
+            )
+        if len(candidates) > 1:
+            raise ServiceError(
+                409,
+                "ambiguous_item",
+                "名称匹配到多个饰品，请改用 SMIS ID",
+                candidates,
+            )
+        return int(candidates[0]["smis_id"])
+
     def _resolve_market_item(self, query: str) -> dict:
         try:
             if query.isdigit():
                 metadata = self.source.fetch_metadata(int(query))
             else:
-                matches = self.search_items(query, limit=10)
-                exact = [
-                    row for row in matches
-                    if str(row.get("name_zh") or "").casefold() == query.casefold()
-                ]
-                candidates = exact if exact else matches
+                candidates = self._market_candidates(query)
                 if not candidates:
                     raise ServiceError(
                         404, "item_not_found", "SMIS 全市场未找到匹配饰品"
@@ -246,26 +430,35 @@ class MonitoringManager:
         item = item_from_row(item_row)
         bootstrap_status: bool | None = False
         try:
-            bootstrap_status = self._ensure_history(item)
+            bootstrap_status = self.history_backfiller.ensure_history(item)
         except Exception as exc:
             bootstrap_status = None
             logger.warning("报价历史回填失败 smis_id=%s: %s", item["smis_id"], exc)
         latest = self.storage.latest_snapshot(item["item_key"])
-        if latest and self._snapshot_age_seconds(latest) <= self.quote_cache_seconds:
-            return self._quote_payload(item_row, latest, cached=True, stale=False)
+        cached_payload = self._cached_quote_payload(
+            item_row,
+            latest,
+            log_invalid=False,
+        )
+        if cached_payload is not None:
+            return cached_payload
 
         lock = self._lock_for(item["smis_id"])
         with lock:
             latest = self.storage.latest_snapshot(item["item_key"])
-            if latest and self._snapshot_age_seconds(latest) <= self.quote_cache_seconds:
-                return self._quote_payload(item_row, latest, cached=True, stale=False)
+            cached_payload = self._cached_quote_payload(item_row, latest)
+            if cached_payload is not None:
+                return cached_payload
             try:
                 snapshot = self.source.fetch_current(item)
                 if bootstrap_status is False:
                     try:
-                        self._backfill_changed_gap(
+                        self.history_backfiller.backfill_changed_gap(
                             item, latest, snapshot,
-                            self.storage.list_rules(smis_id=item["smis_id"]),
+                            self.storage.list_rules(
+                                smis_id=item["smis_id"],
+                                operational_only=True,
+                            ),
                         )
                     except Exception as exc:
                         logger.warning(
@@ -273,45 +466,89 @@ class MonitoringManager:
                             item["smis_id"], exc,
                         )
                 self.storage.save_snapshots([snapshot])
-                row = self.storage.latest_snapshot(item["item_key"])
-                return self._quote_payload(item_row, row, cached=False, stale=False)
+                row = self._snapshot_to_row(snapshot)
+                return self._quote_payload(
+                    item_row,
+                    row,
+                    cached=False,
+                    stale=self._source_snapshot_stale(row),
+                )
             except Exception as exc:
                 if latest:
-                    payload = self._quote_payload(item_row, latest, cached=True, stale=True)
-                    payload["warning"] = f"实时刷新失败，返回最近快照：{exc}"
-                    return payload
+                    try:
+                        payload = self._quote_payload(
+                            item_row,
+                            latest,
+                            cached=True,
+                            stale=True,
+                        )
+                        payload["warning"] = f"实时刷新失败，返回最近快照：{exc}"
+                        return payload
+                    except Exception as cache_exc:
+                        logger.warning(
+                            "忽略损坏的报价缓存 smis_id=%s: %s",
+                            item["smis_id"],
+                            cache_exc,
+                        )
                 raise ServiceError(503, "source_unavailable", f"行情获取失败：{exc}") from exc
 
-    def market_history(self, query: str, days: int = 7) -> dict:
-        item_row = self._resolve_quote_item(query.strip())
-        item = item_from_row(item_row)
+    def _cached_quote_payload(
+        self,
+        item: dict,
+        row: dict | None,
+        *,
+        log_invalid: bool = True,
+    ) -> dict | None:
+        if row is None:
+            return None
         try:
-            snapshots = self.source.fetch_history(item, days)
+            if self._snapshot_age_seconds(row) > self.quote_cache_seconds:
+                return None
+            return self._quote_payload(
+                item,
+                row,
+                cached=True,
+                stale=self._source_snapshot_stale(row),
+            )
         except Exception as exc:
-            raise ServiceError(503, "source_unavailable", f"历史行情获取失败：{exc}") from exc
-        return {
-            "smis_id": item["smis_id"],
-            "name": item["name"],
-            "name_zh": item["name_zh"],
-            "days": int(days),
-            "points": [
-                {
-                    "source_updated_at": value.source_updated_at.isoformat(),
-                    "steam_sell_price": value.steam_sell_price,
-                    "steam_net": value.steam_net,
-                    "platforms": [
-                        {"name": name, "sell_price": price, "sell_num": count}
-                        for name, price, count in value.platform_quotes
-                    ],
-                }
-                for value in snapshots
-            ],
-        }
+            if log_invalid:
+                logger.warning(
+                    "忽略损坏的报价缓存 smis_id=%s: %s",
+                    item["smis_id"],
+                    exc,
+                )
+            return None
+
+    @staticmethod
+    def _snapshot_to_row(snapshot: MarketSnapshot) -> dict:
+        row = asdict(snapshot)
+        row["observed_at"] = snapshot.observed_at.isoformat()
+        row["source_updated_at"] = snapshot.source_updated_at.isoformat()
+        return row
 
     @staticmethod
     def _snapshot_age_seconds(row: dict) -> float:
         observed = datetime.fromisoformat(str(row["observed_at"]))
-        return max(0.0, (datetime.now(timezone.utc) - observed).total_seconds())
+        age_seconds = (datetime.now(timezone.utc) - observed).total_seconds()
+        if age_seconds < -MAX_SOURCE_FUTURE_SKEW_SECONDS:
+            return math.inf
+        return max(0.0, age_seconds)
+
+    def _source_snapshot_stale(self, snapshot: MarketSnapshot | dict) -> bool:
+        value = (
+            snapshot.source_updated_at
+            if isinstance(snapshot, MarketSnapshot)
+            else datetime.fromisoformat(str(snapshot["source_updated_at"]))
+        )
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        age_seconds = (
+            datetime.now(timezone.utc) - value.astimezone(timezone.utc)
+        ).total_seconds()
+        return (
+            age_seconds < -MAX_SOURCE_FUTURE_SKEW_SECONDS
+            or age_seconds > self.poll_interval_seconds
+        )
 
     @staticmethod
     def _snapshot_from_row(row: dict) -> MarketSnapshot:
@@ -364,7 +601,7 @@ class MonitoringManager:
     def _quote_payload(self, item: dict, row: dict, *, cached: bool, stale: bool) -> dict:
         snapshot_object = self._snapshot_from_row(row)
         snapshot = self._snapshot_row_to_dict(row)
-        stats = self._t7_stats(str(item["item_key"]))
+        stats = self._seven_day_history_stats(str(item["item_key"]))
         forecast, risk = self._forecast_and_risk(
             str(item["item_key"]), snapshot_object, stats, stale=stale
         )
@@ -379,113 +616,40 @@ class MonitoringManager:
             },
         }
 
-    def _ensure_history(self, item: dict) -> bool | None:
-        earliest_text = self.storage.earliest_market_time(item["item_key"])
-        if earliest_text:
-            earliest = datetime.fromisoformat(earliest_text)
-            if datetime.now(timezone.utc) - earliest >= timedelta(days=29):
-                return False
-        key = f"history-bootstrap:{item['item_key']}:30"
-        attempted = self.storage.get_metadata(key)
-        if attempted == "done":
-            return False
-        if attempted:
-            try:
-                if datetime.now(timezone.utc) - datetime.fromisoformat(attempted) < timedelta(hours=6):
-                    return None
-            except ValueError:
-                pass
-        self.storage.set_metadata(key, datetime.now(timezone.utc).isoformat())
-        snapshots = self.source.fetch_history(item, 30)
-        self.storage.save_snapshots(snapshots)
-        self.storage.set_metadata(key, "done")
-        return True
-
-    def _attempt_pending_gap_backfill(self, item: dict) -> bool:
-        pending_key = f"history-gap-pending:{item['item_key']}"
-        raw = self.storage.get_metadata(pending_key)
-        if not raw:
-            return False
-        try:
-            pending = json.loads(raw)
-            attempted = pending.get("attempted_at")
-            if attempted and (
-                datetime.now(timezone.utc) - datetime.fromisoformat(attempted)
-                < timedelta(hours=6)
-            ):
-                return True
-            pending["attempted_at"] = datetime.now(timezone.utc).isoformat()
-            self.storage.set_metadata(pending_key, json.dumps(pending))
-            snapshots = self.source.fetch_history(item, int(pending["days"]))
-            self.storage.save_snapshots(snapshots)
-            self.storage.set_metadata(str(pending["done_key"]), "done")
-            self.storage.set_metadata(pending_key, "")
-            return False
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            logger.warning("忽略无效的缺口回填状态 item_key=%s", item["item_key"])
-            self.storage.set_metadata(pending_key, "")
-            return False
-
-    def _backfill_changed_gap(
-        self, item: dict, previous: dict | None, snapshot: MarketSnapshot, rules: list[dict],
-    ) -> None:
-        if self._attempt_pending_gap_backfill(item):
-            return
-        if previous is None:
-            return
-        previous_observed = datetime.fromisoformat(str(previous["observed_at"]))
-        gap_seconds = max(0.0, (snapshot.observed_at - previous_observed).total_seconds())
-        had_failure = any(
-            int(self.storage.get_health_state(item["smis_id"], str(rule["recipient_key"]))[
-                "fetch_failures"
-            ]) > 0
-            for rule in rules
+    def _seven_day_history_stats(self, item_key: str) -> dict:
+        return seven_day_history_stats(
+            self.storage.steam_history(
+                item_key,
+                days=7,
+                max_current_lag_seconds=self.poll_interval_seconds,
+            )
         )
-        missed_observation = gap_seconds > self.poll_interval_seconds * 2
-        if not had_failure and not missed_observation:
-            return
-        if snapshot_fingerprint(previous) == snapshot_fingerprint(snapshot):
-            return
-        days = max(1, min(30, math.ceil(gap_seconds / 86400)))
-        signature = (
-            f"{item['item_key']}|{previous['observed_at']}|"
-            f"{snapshot.observed_at.isoformat()}|{days}"
-        )
-        digest = sha1(signature.encode("utf-8")).hexdigest()[:16]
-        key = f"history-gap:{item['item_key']}:{digest}"
-        state = self.storage.get_metadata(key)
-        if state == "done":
-            return
-        pending_key = f"history-gap-pending:{item['item_key']}"
-        pending = {
-            "done_key": key,
-            "days": days,
-            "gap_started_at": previous["observed_at"],
-            "gap_ended_at": snapshot.observed_at.isoformat(),
-            "attempted_at": None,
-        }
-        self.storage.set_metadata(pending_key, json.dumps(pending))
-        self._attempt_pending_gap_backfill(item)
-
-    def _t7_stats(self, item_key: str) -> dict:
-        return t7_stats(self.storage.steam_history(item_key, days=7))
 
     def _forecast_and_risk(
         self, item_key: str, snapshot: MarketSnapshot, stats: dict, *, stale: bool = False,
     ) -> tuple[dict, dict]:
         rows = self.storage.market_history_rows(item_key, days=30)
-        return forecast_and_risk(rows, snapshot, stats, stale=stale)
+        return forecast_and_risk(
+            rows,
+            snapshot,
+            stats,
+            stale=stale,
+            max_current_lag_seconds=self.poll_interval_seconds,
+        )
 
     def monitor_item(self, item_row: dict) -> dict:
         item = item_from_row(item_row)
-        rules = self.storage.list_rules(smis_id=item["smis_id"])
+        rules = self.storage.list_rules(
+            smis_id=item["smis_id"],
+            operational_only=True,
+        )
         if not rules:
             return {"smis_id": item["smis_id"], "skipped": True}
         previous = self.storage.latest_snapshot(item["item_key"])
         bootstrap_status: bool | None = False
         try:
             try:
-                bootstrap_status = self._ensure_history(item)
+                bootstrap_status = self.history_backfiller.ensure_history(item)
             except Exception as exc:
                 bootstrap_status = None
                 logger.warning("T+7 历史回填失败 smis_id=%s: %s", item["smis_id"], exc)
@@ -493,7 +657,12 @@ class MonitoringManager:
                 snapshot = self.source.fetch_current(item)
                 if bootstrap_status is False:
                     try:
-                        self._backfill_changed_gap(item, previous, snapshot, rules)
+                        self.history_backfiller.backfill_changed_gap(
+                            item,
+                            previous,
+                            snapshot,
+                            rules,
+                        )
                     except Exception as exc:
                         logger.warning("缺口历史回填失败 smis_id=%s: %s", item["smis_id"], exc)
                 self.storage.save_snapshots([snapshot])
@@ -502,121 +671,88 @@ class MonitoringManager:
             return {"smis_id": item["smis_id"], "success": False, "error": str(exc)}
 
         self._handle_item_recovery(item, rules, snapshot)
-        stats = self._t7_stats(item["item_key"])
-        forecast, risk = self._forecast_and_risk(item["item_key"], snapshot, stats)
+        stats = self._seven_day_history_stats(item["item_key"])
+        stale = self._source_snapshot_stale(snapshot)
+        forecast, risk = self._forecast_and_risk(
+            item["item_key"],
+            snapshot,
+            stats,
+            stale=stale,
+        )
+        unavailable_status = "行情数据已过期" if stale else None
         for rule in rules:
-            self._evaluate_rule(snapshot, stats, forecast, risk, rule)
-        return {"smis_id": item["smis_id"], "success": True}
+            self._evaluate_rule(
+                snapshot,
+                stats,
+                forecast,
+                risk,
+                rule,
+                unavailable_status=unavailable_status,
+            )
+        return {"smis_id": item["smis_id"], "success": True, "stale": stale}
 
     def _evaluate_rule(
         self, snapshot: MarketSnapshot, stats: dict, forecast: dict,
-        risk: dict, rule: dict,
+        risk: dict, rule: dict, *, unavailable_status: str | None = None,
     ) -> None:
         rule_id = int(rule["id"])
         rule_type = str(rule["rule_type"])
-        threshold = float(rule["threshold"])
-        state = self.storage.get_rule_state(rule_id)
-        value, baseline, status = rule_value(snapshot, forecast, rule_type)
-        observed = snapshot.observed_at.isoformat()
-        changes = {
-            "last_value": value, "last_baseline": baseline,
-            "last_observed_at": observed, "status": status,
-        }
-        if value is None:
-            changes.update({"qualifying_count": 0, "clearing_count": 0})
-            self.storage.update_rule_state(rule_id, **changes)
+        definition = get_rule_definition(rule_type)
+        status = self._rule_configuration_error(rule_type, rule["threshold"])
+        if definition is None or status is not None:
+            self._quarantine_rule(
+                rule,
+                status or f"不支持的规则类型：{rule_type}",
+            )
             return
-
-        limit = threshold / 100 if rule_type in {"ratio", "t7"} else threshold
-        qualifies = value >= limit if rule_type == "steam" else value <= limit
-        if not state["alert_active"]:
-            qualifying = int(state["qualifying_count"]) + 1 if qualifies else 0
-            changes.update({"qualifying_count": qualifying, "clearing_count": 0})
-            if qualifying >= self.confirmations:
-                initial_level, initial_depth = self._breakthrough_level(
-                    rule_type, limit, value
+        state = self.storage.get_rule_state(rule_id)
+        measurement = (
+            RuleMeasurement(None, None, unavailable_status)
+            if unavailable_status is not None
+            else measure_rule(snapshot, forecast, rule_type)
+        )
+        observed = snapshot.observed_at.isoformat()
+        transition = evaluate_rule_transition(
+            rule_id=rule_id,
+            definition=definition,
+            threshold=float(rule["threshold"]),
+            state=state,
+            measurement=measurement,
+            observed_at=observed,
+            confirmations=self.confirmations,
+            clear_confirmations=self.clear_confirmations,
+            breakthrough_step=self.breakthrough_step,
+        )
+        if transition.changes.get("status") == "规则状态无效":
+            self._quarantine_rule(rule, "规则状态无效")
+            return
+        if transition.signal is not None:
+            signal = transition.signal
+            if signal.style == "breakthrough":
+                title, content = format_breakthrough_alert(
+                    snapshot,
+                    stats,
+                    forecast,
+                    risk,
+                    rule,
+                    signal.value,
+                    signal.depth,
+                    signal.level,
                 )
-                if initial_level > 0:
-                    title, content = self._format_breakthrough_alert(
-                        snapshot, stats, forecast, risk, rule,
-                        value, initial_depth, initial_level
-                    )
-                else:
-                    title, content = self._format_rule_alert(
-                        snapshot, stats, forecast, risk, rule, value
-                    )
-                signal = f"rule:{rule_id}:{observed}"
-                self.storage.enqueue_notification(
-                    signal, str(rule["recipient_key"]), f"rule_{rule_type}", title, content,
-                    driver=self.delivery_driver, rule_id=rule_id,
-                )
-                changes.update({
-                    "alert_active": 1, "qualifying_count": qualifying,
-                    "last_signal_at": observed,
-                    "highest_notified_level": initial_level,
-                })
-        else:
-            clear_boundary = limit * (0.97 if rule_type == "steam" else 1.03)
-            clears = value < clear_boundary if rule_type == "steam" else value > clear_boundary
-            clearing = int(state["clearing_count"]) + 1 if clears else 0
-            changes.update({"qualifying_count": 0, "clearing_count": clearing})
-            if clearing >= self.clear_confirmations:
-                changes.update({
-                    "alert_active": 0, "clearing_count": 0,
-                    "highest_notified_level": 0,
-                })
             else:
-                level, depth = self._breakthrough_level(rule_type, limit, value)
-                previous_level = int(state["highest_notified_level"])
-                if qualifies and level > previous_level:
-                    title, content = self._format_breakthrough_alert(
-                        snapshot, stats, forecast, risk, rule, value, depth, level
-                    )
-                    self.storage.enqueue_notification(
-                        f"rule:{rule_id}:breakthrough:{level}:{observed}",
-                        str(rule["recipient_key"]), "rule_breakthrough", title, content,
-                        driver=self.delivery_driver, rule_id=rule_id,
-                    )
-                    changes["last_signal_at"] = observed
-                # This legacy field now tracks the current level, allowing a
-                # later upward re-entry into a previously reached level to alert.
-                changes["highest_notified_level"] = level if qualifies else 0
-        self.storage.update_rule_state(rule_id, **changes)
-
-    def _breakthrough_level(
-        self, rule_type: str, limit: float, value: float
-    ) -> tuple[int, float]:
-        depth = (
-            (value - limit) / limit
-            if rule_type == "steam"
-            else (limit - value) / limit
-        )
-        depth = max(0.0, depth)
-        return math.floor((depth + 1e-12) / self.breakthrough_step), depth
-
-    @classmethod
-    def _format_breakthrough_alert(
-        cls, snapshot: MarketSnapshot, stats: dict, forecast: dict,
-        risk: dict, rule: dict,
-        value: float, depth: float, level: int,
-    ) -> tuple[str, str]:
-        rule_type = str(rule["rule_type"])
-        labels = {
-            "ratio": "即时比例", "t7": "七日预测比例",
-            "platform": "最低平台价", "steam": "Steam 售价",
-        }
-        value_text = f"{value:.2%}" if rule_type in {"ratio", "t7"} else f"¥{value:.2f}"
-        threshold = float(rule["threshold"])
-        threshold_text = (
-            f"{threshold:.2f}%" if rule_type in {"ratio", "t7"} else f"¥{threshold:.2f}"
-        )
-        lines = [
-            f"规则 #{int(rule['id'])} · {snapshot.name_zh} / {snapshot.name}",
-            f"{labels[rule_type]}：{value_text}（阈值 {threshold_text}）",
-            f"相对阈值继续突破：{depth:.2%}，达到第 {level} 档",
-        ]
-        lines.extend(cls._market_reference_lines(snapshot, stats, forecast, risk))
-        return f"【继续突破·第 {level} 档】{snapshot.name_zh} {value_text}", "\n".join(lines)
+                title, content = format_rule_alert(
+                    snapshot, stats, forecast, risk, rule, signal.value
+                )
+            self.storage.enqueue_notification(
+                signal.signal_key,
+                str(rule["recipient_key"]),
+                signal.event_type,
+                title,
+                content,
+                driver=self.delivery_driver,
+                rule_id=rule_id,
+            )
+        self.storage.update_rule_state(rule_id, **transition.changes)
 
     def enqueue_daily_summary(self, summary_date: date) -> int:
         date_text = summary_date.isoformat()
@@ -625,33 +761,73 @@ class MonitoringManager:
             return 0
 
         grouped: dict[str, list[tuple[dict, dict, int, float]]] = defaultdict(list)
-        for rule in self.storage.list_rules():
+        item_freshness: dict[str, bool] = {}
+        for rule in self.storage.list_rules(operational_only=True):
+            item_key = str(rule["item_key"])
+            if item_key not in item_freshness:
+                latest = self.storage.latest_snapshot(item_key)
+                try:
+                    item_freshness[item_key] = bool(
+                        latest
+                        and self._snapshot_age_seconds(latest)
+                        <= self.poll_interval_seconds * 2
+                        and not self._source_snapshot_stale(latest)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "日报忽略损坏的行情缓存 item_key=%s: %s",
+                        item_key,
+                        exc,
+                    )
+                    item_freshness[item_key] = False
+            if not item_freshness[item_key]:
+                continue
             state = self.storage.get_rule_state(int(rule["id"]))
             value = state.get("last_value")
-            if not state.get("alert_active") or value is None:
+            if not _state_count(state.get("alert_active")) or value is None:
                 continue
             rule_type = str(rule["rule_type"])
-            threshold = float(rule["threshold"])
-            limit = threshold / 100 if rule_type in {"ratio", "t7"} else threshold
-            qualifies = float(value) >= limit if rule_type == "steam" else float(value) <= limit
-            if not qualifies:
+            definition = get_rule_definition(rule_type)
+            status = self._rule_configuration_error(rule_type, rule["threshold"])
+            if definition is None or status is not None:
+                self._quarantine_rule(
+                    rule,
+                    status or f"不支持的规则类型：{rule_type}",
+                )
                 continue
-            level, depth = self._breakthrough_level(rule_type, limit, float(value))
+            current_value = _positive_finite(value)
+            if current_value is None:
+                self._quarantine_rule(rule, "测量值无效")
+                continue
+            threshold = float(rule["threshold"])
+            limit = definition.limit(threshold)
+            if not definition.qualifies(current_value, limit):
+                continue
+            try:
+                level, depth = definition.breakthrough(
+                    current_value,
+                    limit,
+                    self.breakthrough_step,
+                )
+            except (ArithmeticError, TypeError, ValueError):
+                self._quarantine_rule(rule, "测量值无效")
+                continue
             grouped[str(rule["recipient_key"])].append((rule, state, level, depth))
 
         queued = 0
-        labels = {
-            "ratio": "即时比例", "t7": "T+7 预测比例",
-            "platform": "平台价", "steam": "Steam 价",
-        }
         analysis_cache: dict[str, tuple[dict, dict]] = {}
         for recipient_key, entries in sorted(grouped.items()):
             lines = [f"当前仍满足条件的交易告警共 {len(entries)} 条："]
             for rule, state, level, depth in entries:
                 rule_type = str(rule["rule_type"])
-                value = float(state["last_value"])
+                definition = get_rule_definition(rule_type)
+                if definition is None:
+                    continue
+                value = _positive_finite(state["last_value"])
+                if value is None:
+                    continue
                 threshold = float(rule["threshold"])
-                if rule_type in {"ratio", "t7"}:
+                if definition.percentage:
                     values = f"{value:.2%} / 阈值 {threshold:.2f}%"
                 else:
                     values = f"¥{value:.2f} / 阈值 ¥{threshold:.2f}"
@@ -660,10 +836,11 @@ class MonitoringManager:
                     latest = self.storage.latest_snapshot(item_key)
                     if latest:
                         snapshot = self._snapshot_from_row(latest)
-                        stats = self._t7_stats(item_key)
+                        stats = self._seven_day_history_stats(item_key)
                         stale = (
                             self._snapshot_age_seconds(latest)
                             > self.poll_interval_seconds * 2
+                            or self._source_snapshot_stale(latest)
                         )
                         analysis_cache[item_key] = self._forecast_and_risk(
                             item_key, snapshot, stats, stale=stale
@@ -672,9 +849,9 @@ class MonitoringManager:
                         unavailable = {"status": "unavailable"}
                         analysis_cache[item_key] = (unavailable, unavailable)
                 forecast, risk = analysis_cache[item_key]
-                analysis_suffix = self._daily_analysis_suffix(forecast, risk)
+                analysis_suffix = daily_analysis_suffix(forecast, risk)
                 lines.append(
-                    f"#{int(rule['id'])} {rule['cn_name']} · {labels[rule_type]} "
+                    f"#{int(rule['id'])} {rule['cn_name']} · {definition.daily_label} "
                     f"{values} · 第 {level} 档（{depth:.2%}）{analysis_suffix}"
                 )
             queued += int(self.storage.enqueue_notification(
@@ -688,8 +865,11 @@ class MonitoringManager:
     def _handle_item_failure(self, item: dict, rules: list[dict], exc: Exception) -> None:
         for recipient_key in sorted({str(rule["recipient_key"]) for rule in rules}):
             state = self.storage.get_health_state(item["smis_id"], recipient_key)
-            failures = int(state["fetch_failures"]) + 1
-            alerted = int(state["health_alerted"])
+            failures = min(
+                _state_count(state.get("fetch_failures")) + 1,
+                MAX_RULE_STATE_INTEGER,
+            )
+            alerted = 1 if _state_count(state.get("health_alerted")) else 0
             if failures >= self.health_failure_threshold and not alerted:
                 self.storage.enqueue_notification(
                     f"health:{item['item_key']}:{recipient_key}:down:{failures}",
@@ -707,7 +887,7 @@ class MonitoringManager:
     def _handle_item_recovery(self, item: dict, rules: list[dict], snapshot: MarketSnapshot) -> None:
         for recipient_key in sorted({str(rule["recipient_key"]) for rule in rules}):
             state = self.storage.get_health_state(item["smis_id"], recipient_key)
-            if state["health_alerted"]:
+            if _state_count(state.get("health_alerted")):
                 self.storage.enqueue_notification(
                     f"health:{item['item_key']}:{recipient_key}:recovered:"
                     f"{snapshot.observed_at.isoformat()}",
@@ -719,193 +899,11 @@ class MonitoringManager:
                 item["smis_id"], recipient_key, fetch_failures=0, health_alerted=0
             )
 
-    @staticmethod
-    def _level_text(level: object) -> str:
-        return {"low": "低", "medium": "中", "high": "高"}.get(
-            str(level), "未知"
-        )
-
-    @classmethod
-    def _analysis_reference_lines(
-        cls, forecast: dict, risk: dict, *,
-        current_steam_net: float | None = None,
-        t7_steam_net_p25: float | None = None,
-    ) -> list[str]:
-        lines: list[str] = []
-        if forecast.get("status") == "ready":
-            ratio = forecast.get("forecast_balance_ratio")
-            ratio_text = f"{float(ratio):.2%}" if ratio is not None else "不可用"
-            window = int(forecast.get("window_days") or 0)
-            window_text = f"{window} 日" if window else ""
-            lines.extend([
-                f"七日预测：¥{float(forecast['predicted_steam_net']):.2f}"
-                f"（{float(forecast['change_pct']) / 100:+.1%}）"
-                f"｜预测倒余额比例 {ratio_text}",
-                f"预测模式：{window_text}{forecast['mode_label']}（"
-                f"{'正常' if forecast.get('confidence') == 'normal' else '低'}置信度）",
-            ])
-        else:
-            reasons = forecast.get("reasons") or ["历史或当前行情不足"]
-            lines.append(f"七日预测：不可用（{reasons[0]}）")
-
-        if risk.get("status") == "ready":
-            dimensions = risk.get("dimensions") or {}
-            labels = {"price": "价格", "volatility": "波动", "inventory": "库存", "volume": "成交量"}
-            dimension_parts = []
-            for key in labels:
-                level = (dimensions.get(key) or {}).get("level")
-                level_text = "不可用" if level in {None, "unknown"} else cls._level_text(level)
-                dimension_parts.append(f"{labels[key]}{level_text}")
-            dimension_text = "、".join(dimension_parts)
-            ratio = risk.get("risk_balance_ratio")
-            confidence = "正常" if risk.get("confidence") == "normal" else "低"
-            lines.append(
-                f"风险评估：总体{cls._level_text(risk.get('overall_level'))}"
-                f"（{confidence}置信度）｜{dimension_text}"
-            )
-            risk_net = risk.get("risk_steam_net")
-            forecast_net = forecast.get("predicted_steam_net")
-
-            def same_display_price(left: object, right: object) -> bool:
-                if left is None or right is None:
-                    return False
-                return round(float(left), 2) == round(float(right), 2)
-
-            if ratio is None:
-                lines.append("风险倒余额比例：不可用")
-            elif same_display_price(risk_net, current_steam_net):
-                lines.append("风险倒余额比例：同即时比例（当前到手价为风险底价）")
-            elif forecast.get("status") == "ready" and same_display_price(
-                risk_net, forecast_net
-            ):
-                lines.append("风险倒余额比例：同预测比例（七日预测价为风险底价）")
-            elif same_display_price(risk_net, t7_steam_net_p25):
-                lines.append(
-                    f"风险倒余额比例：{float(ratio):.2%}"
-                    "（七日历史 P25 为风险底价）"
-                )
-            else:
-                risk_net_text = (
-                    f"（风险底价 ¥{float(risk_net):.2f}）"
-                    if risk_net is not None else ""
-                )
-                lines.append(f"风险倒余额比例：{float(ratio):.2%}{risk_net_text}")
-            reasons = risk.get("reasons") or []
-            if reasons:
-                lines.append(f"风险说明：{'；'.join(str(reason) for reason in reasons[:3])}")
-        else:
-            lines.append("风险评估：不可用")
-        return lines
-
-    @classmethod
-    def _daily_analysis_suffix(cls, forecast: dict, risk: dict) -> str:
-        if forecast.get("status") == "ready":
-            forecast_ratio = forecast.get("forecast_balance_ratio")
-            forecast_text = (
-                f"预测{float(forecast['change_pct']) / 100:+.1%}"
-                f"/{float(forecast_ratio):.2%}"
-                if forecast_ratio is not None else
-                f"预测{float(forecast['change_pct']) / 100:+.1%}"
-            )
-            mode_text = str(forecast.get("mode_label") or "未知模式")
-        else:
-            forecast_text, mode_text = "预测不可用", ""
-        if risk.get("status") == "ready":
-            risk_ratio = risk.get("risk_balance_ratio")
-            risk_text = f"风险{cls._level_text(risk.get('overall_level'))}"
-            if risk_ratio is not None:
-                forecast_ratio = forecast.get("forecast_balance_ratio")
-                if (
-                    forecast.get("status") == "ready"
-                    and forecast_ratio is not None
-                    and f"{float(risk_ratio):.2%}" == f"{float(forecast_ratio):.2%}"
-                ):
-                    risk_text += "/同预测比例"
-                else:
-                    risk_text += f"/{float(risk_ratio):.2%}"
-        else:
-            risk_text = "风险不可用"
-        mode_suffix = f"({mode_text})" if mode_text else ""
-        return f" · {forecast_text}{mode_suffix} · {risk_text}"
-
-    @classmethod
-    def _market_reference_lines(
-        cls, snapshot: MarketSnapshot, stats: dict,
-        forecast: dict, risk: dict,
-    ) -> list[str]:
-        lines: list[str] = []
-        lowest = snapshot.lowest_platform
-        if lowest:
-            lines.append(f"最低平台：{lowest[0]} ¥{lowest[1]:.2f}（在售 {lowest[2]}）")
-        lines.extend([
-            f"Steam 售价：¥{float(snapshot.steam_sell_price or 0):.2f}",
-            f"Steam 预计到手：¥{snapshot.steam_net:.2f}",
-            f"Steam 在售/日成交：{snapshot.steam_sell_num or 0}/{snapshot.steam_transaction_quantity or 0}",
-        ])
-        if stats.get("t7_steam_net_p25") is not None:
-            history_label = (
-                "七日历史基准" if stats.get("t7_sufficient")
-                else "七日历史参考（样本不足）"
-            )
-            lines.append(
-                f"{history_label}：到手最低 ¥{stats['t7_steam_net_low']:.2f}｜"
-                f"P25 ¥{stats['t7_steam_net_p25']:.2f}｜"
-                f"中位 ¥{stats['t7_steam_net_median']:.2f}"
-            )
-        lines.extend(cls._analysis_reference_lines(
-            forecast, risk,
-            current_steam_net=snapshot.steam_net,
-            t7_steam_net_p25=stats.get("t7_steam_net_p25"),
-        ))
-        lines.extend([
-            f"数据更新时间：{snapshot.source_updated_at.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
-            f"SMIS：https://smis.club/commodity/{snapshot.smis_id}",
-            f"Steam：https://steamcommunity.com/market/listings/{snapshot.appid}/{quote(snapshot.name)}",
-        ])
-        return lines
-
-    @classmethod
-    def _format_rule_alert(
-        cls, snapshot: MarketSnapshot, stats: dict, forecast: dict, risk: dict,
-        rule: dict, value: float,
-    ) -> tuple[str, str]:
-        labels = {
-            "ratio": ("【即时挂刀】", "即时比例"),
-            "t7": ("【T+7预测挂刀】", "七日预测比例"),
-            "platform": ("【平台到价】", "最低平台价"),
-            "steam": ("【Steam清仓】", "Steam 售价"),
-        }
-        rule_type = str(rule["rule_type"])
-        prefix, metric_label = labels[rule_type]
-        threshold = float(rule["threshold"])
-        value_text = f"{value:.2%}" if rule_type in {"ratio", "t7"} else f"¥{value:.2f}"
-        threshold_text = f"{threshold:.2f}%" if rule_type in {"ratio", "t7"} else f"¥{threshold:.2f}"
-        lines = [
-            f"规则 #{int(rule['id'])} · {snapshot.name_zh} / {snapshot.name}",
-            f"{metric_label}：{value_text}（阈值 {threshold_text}）",
-        ]
-        lines.extend(cls._market_reference_lines(snapshot, stats, forecast, risk))
-        return f"{prefix}{snapshot.name_zh} {value_text}", "\n".join(lines)
-
-    def dispatch_outbox(self) -> dict[str, int]:
-        if self.notifier is None:
-            return {"sent": 0, "failed": 0}
-        with self._dispatch_lock:
-            sent = failed = 0
-            for message in self.storage.due_notifications():
-                result = self.notifier.send_to(
-                    message["recipient_key"], message["title"], message["content"]
-                )
-                if result.success:
-                    self.storage.mark_notification_sent(message["id"])
-                    sent += 1
-                else:
-                    self.storage.mark_notification_failed(message["id"], result.message)
-                    failed += 1
-            return {"sent": sent, "failed": failed}
-
     def run_cycle(self, max_workers: int = 4) -> list[dict]:
-        active_ids = {int(rule["smis_id"]) for rule in self.storage.list_rules()}
+        active_ids = {
+            int(rule["smis_id"])
+            for rule in self.storage.list_rules(operational_only=True)
+        }
         items = [
             item for item in self.storage.list_items(enabled_only=True)
             if int(item["smis_id"]) in active_ids
@@ -920,8 +918,6 @@ class MonitoringManager:
                     except Exception as exc:
                         logger.exception("监控任务异常")
                         results.append({"success": False, "error": str(exc)})
-        if self.notifier is not None:
-            self.dispatch_outbox()
         return results
 
     def test_event(self, recipient_key: str) -> dict:
@@ -932,14 +928,4 @@ class MonitoringManager:
             f"服务链路正常。\n测试时间：{now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
             driver=self.delivery_driver,
         )
-        if self.notifier is not None:
-            self.dispatch_outbox()
         return self.storage.list_events(recipient_key, limit=1)[0]
-
-    def backup(self, backup_dir: Path, retain: int = 7) -> Path:
-        destination = backup_dir / f"monitor-{datetime.now().strftime('%Y%m%d')}.db"
-        self.storage.backup(destination)
-        backups = sorted(backup_dir.glob("monitor-*.db"), reverse=True)
-        for old in backups[retain:]:
-            old.unlink(missing_ok=True)
-        return destination

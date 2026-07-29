@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime
 from math import floor
+
+MAX_SOURCE_FUTURE_SKEW_SECONDS = 300
 
 
 def steam_net_amount(gross_price: float) -> float:
@@ -73,27 +75,3 @@ class MarketSnapshot:
 
     def ratio(self) -> float | None:
         return self.calculated_ratio if self.kind == "current" else self.buff_to_steam_ratio
-
-
-@dataclass(frozen=True)
-class HistoryStats:
-    count: int = 0
-    median: float | None = None
-    percentile_10: float | None = None
-    percentile_25: float | None = None
-    current_percentile: float | None = None
-
-
-@dataclass(frozen=True)
-class StrategyContext:
-    snapshot: MarketSnapshot
-    now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    history: HistoryStats = field(default_factory=HistoryStats)
-
-
-@dataclass(frozen=True)
-class StrategyResult:
-    eligible: bool
-    ratio: float | None
-    reasons: tuple[str, ...]
-    strategy_name: str

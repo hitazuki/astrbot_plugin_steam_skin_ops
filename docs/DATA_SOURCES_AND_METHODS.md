@@ -65,6 +65,11 @@ buffExchangeSteamBySell
   再尝试。
 - 当前快照的 `observed_at` 是插件实际获取时间；`source_updated_at` 来自
   SMIS 的 `updateTime`，按北京时间解析后转换为 UTC。
+- 即使接口请求成功，只要 `source_updated_at` 已超过一个配置的轮询周期，
+  该快照就标记为过期：仍保存并可作为缓存展示，且请求健康状态视为正常，
+  但四类交易规则均不求值、不触发告警，预测与风险结果也标记为不可用；
+  此类轮询快照也不计入后续历史覆盖率、七日统计或模型训练样本。
+- 来源时间明显晚于本机时间（允许最多 5 分钟时钟偏差）同样按无效快照处理。
 - 历史快照的观测时间和来源更新时间都采用 SMIS 历史序列提供的时间戳。
 - 行情、历史、规则状态和通知记录保存在 AstrBot 的
   `data/plugin_data/astrbot_plugin_steam_skin_ops/monitor.db`。

@@ -19,7 +19,7 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
 
-def t7_stats(rows: list[dict]) -> dict:
+def seven_day_history_stats(rows: list[dict]) -> dict:
     values = [steam_net_amount(float(row["steam_sell_price"])) for row in rows]
     values = [value for value in values if value > 0]
     span_days = 0.0
@@ -35,3 +35,8 @@ def t7_stats(rows: list[dict]) -> dict:
         "t7_steam_net_p25": percentile(values, 0.25),
         "t7_steam_net_median": median(values) if values else None,
     }
+
+
+# Compatibility alias. The explicit internal name distinguishes this historical
+# summary from the dynamic seven-day forecast consumed by t7 rules.
+t7_stats = seven_day_history_stats

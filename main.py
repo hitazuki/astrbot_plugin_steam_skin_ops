@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+import math
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -12,7 +12,9 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from .core.config import ConfigError, PluginSettings, load_settings
 from .core.integrations.smis import SmisClient
 from .core.manager import MonitoringManager, ServiceError
+from .core.presentation import format_quote
 from .core.repository import MonitorStorage
+from .core.rules import get_rule_definition
 from .core.runtime import PluginRuntime
 
 PLUGIN_NAME = "astrbot_plugin_steam_skin_ops"
@@ -42,7 +44,7 @@ class SteamSkinOpsPlugin(Star):
         except ConfigError as exc:
             self.settings = None
             self.config_errors = exc.errors
-            self.source = self.manager = self.runtime = None
+            self.source = self.storage = self.manager = self.runtime = None
             logger.error("Steam Skin Ops 配置无效：%s", "；".join(exc.errors))
             return
 
@@ -53,8 +55,9 @@ class SteamSkinOpsPlugin(Star):
             max_retries=self.settings.smis_max_retries,
             min_request_interval=self.settings.smis_min_request_interval_seconds,
         )
+        self.storage = MonitorStorage(data_dir / "monitor.db")
         self.manager = MonitoringManager(
-            MonitorStorage(data_dir / "monitor.db"),
+            self.storage,
             self.source,
             max_items=self.settings.max_items,
             quote_cache_seconds=self.settings.quote_cache_seconds,
@@ -84,10 +87,10 @@ class SteamSkinOpsPlugin(Star):
         return await asyncio.to_thread(func, *args)
 
     async def _dispatch_outbox(self) -> dict[str, int]:
-        manager = self._require_manager()
+        self._require_manager()
         async with self._dispatch_lock:
             sent = failed = 0
-            messages = await self._call(manager.storage.due_notifications)
+            messages = await self._call(self.storage.due_notifications)
             for message in messages:
                 try:
                     chain = MessageChain().message(
@@ -98,7 +101,7 @@ class SteamSkinOpsPlugin(Star):
                     raise
                 except Exception as exc:
                     await self._call(
-                        manager.storage.mark_notification_failed,
+                        self.storage.mark_notification_failed,
                         message["id"],
                         str(exc),
                     )
@@ -106,153 +109,27 @@ class SteamSkinOpsPlugin(Star):
                     logger.warning("Steam Skin Ops 主动消息发送失败：%s", exc)
                 else:
                     await self._call(
-                        manager.storage.mark_notification_sent, message["id"]
+                        self.storage.mark_notification_sent, message["id"]
                     )
                     sent += 1
             return {"sent": sent, "failed": failed}
 
     @staticmethod
     def _error_text(exc: Exception) -> str:
-        if isinstance(exc, ServiceError) and exc.data:
+        if isinstance(exc, ServiceError):
+            if not exc.data:
+                return exc.message
             lines = [exc.message]
             for row in exc.data:
                 suffix = f" / {row.get('name')}" if row.get("name") else ""
                 lines.append(f"{row['smis_id']} - {row['name_zh']}{suffix}")
             return "\n".join(lines)
-        return str(exc)
+        logger.exception("Steam Skin Ops 命令处理出现未预期异常")
+        return "插件内部错误，请查看 AstrBot 日志"
 
     @staticmethod
     def _format_quote(data: dict) -> str:
-        marker = "（缓存）" if data.get("cached") else "（实时）"
-        if data.get("stale"):
-            marker = "（过期快照）"
-        ratio = data.get("ratio")
-        ratio_text = f"{float(ratio):.2%}" if ratio is not None else "未知"
-        source_time = data.get("source_updated_at", "")
-        try:
-            source_time = datetime.fromisoformat(source_time).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        except (TypeError, ValueError):
-            pass
-        lines = [
-            f"{data['name_zh']} / {data['name']}  [SMIS {data['smis_id']}]",
-            f"即时倒余额比例：{ratio_text} {marker}",
-        ]
-        platforms = data.get("platforms") or []
-        if platforms:
-            lines.append("平台售价：")
-            for platform in platforms:
-                tags = []
-                if platform.get("is_lowest"):
-                    tags.append("最低")
-                tags.append(f"在售 {platform.get('sell_num') or 0}")
-                prefix = "★" if platform.get("is_lowest") else "-"
-                lines.append(
-                    f"{prefix} {platform['name']}：¥{float(platform['sell_price']):.2f}"
-                    f"（{'，'.join(tags)}）"
-                )
-        else:
-            lines.append("平台售价：暂无有效数据")
-        lines.extend([
-            f"Steam 售价：¥{float(data['steam_sell_price'] or 0):.2f}",
-            f"Steam 预计到手：¥{float(data['steam_net'] or 0):.2f}",
-            f"Steam 日成交量：{data.get('steam_transaction_quantity') or 0}",
-        ])
-        if data.get("t7_steam_net_p25") is not None:
-            history_label = (
-                "七日历史基准" if data.get("t7_sufficient")
-                else "七日历史参考（样本不足）"
-            )
-            lines.append(
-                f"{history_label}：Steam 到手 P25 "
-                f"¥{float(data['t7_steam_net_p25']):.2f}"
-                f"（{data.get('t7_sample_count', 0)} 点 / "
-                f"{data.get('t7_span_days', 0)} 天）"
-            )
-        forecast = data.get("forecast") or {}
-        if forecast.get("status") == "ready":
-            forecast_ratio = forecast.get("forecast_balance_ratio")
-            ratio_text = (
-                f"{float(forecast_ratio):.2%}"
-                if forecast_ratio is not None else "不可用"
-            )
-            lines.append(
-                f"七日预测：¥{float(forecast['predicted_steam_net']):.2f}"
-                f"（{float(forecast['change_pct']) / 100:+.1%}）"
-            )
-            window = int(forecast.get("window_days") or 0)
-            window_text = f"{window} 日" if window else ""
-            confidence = "正常" if forecast.get("confidence") == "normal" else "低"
-            lines.extend([
-                f"预测模式：{window_text}{forecast.get('mode_label') or '未知'}"
-                f"（{confidence}置信度）",
-                f"预测倒余额比例：{ratio_text}",
-            ])
-        else:
-            reason = (forecast.get("reasons") or ["历史或当前行情不足"])[0]
-            lines.append(f"七日预测：不可用（{reason}）")
-
-        risk = data.get("risk_assessment") or {}
-        if risk.get("status") == "ready":
-            level_text = {"low": "低", "medium": "中", "high": "高"}
-            dimensions = risk.get("dimensions") or {}
-            dimension_labels = {
-                "price": "价格", "volatility": "波动",
-                "inventory": "库存", "volume": "成交量",
-            }
-            detail_parts = []
-            for key, label in dimension_labels.items():
-                dimension = dimensions.get(key) or {}
-                dimension_level = level_text.get(dimension.get("level"), "不可用")
-                detail_parts.append(f"{label}{dimension_level}")
-            detail = "、".join(detail_parts)
-            risk_confidence = "正常" if risk.get("confidence") == "normal" else "低"
-            lines.append(
-                f"风险评估：总体{level_text.get(risk.get('overall_level'), '未知')}"
-                f"（{risk_confidence}置信度）｜{detail}"
-            )
-            risk_ratio = risk.get("risk_balance_ratio")
-            risk_net = risk.get("risk_steam_net")
-            current_net = data.get("steam_net")
-            forecast_net = forecast.get("predicted_steam_net")
-            history_p25 = data.get("t7_steam_net_p25")
-
-            def same_display_price(left: object, right: object) -> bool:
-                if left is None or right is None:
-                    return False
-                return round(float(left), 2) == round(float(right), 2)
-
-            if risk_ratio is None:
-                lines.append("风险倒余额比例：不可用")
-            elif same_display_price(risk_net, current_net):
-                lines.append("风险倒余额比例：同即时比例（当前到手价为风险底价）")
-            elif forecast.get("status") == "ready" and same_display_price(
-                risk_net, forecast_net
-            ):
-                lines.append("风险倒余额比例：同预测比例（七日预测价为风险底价）")
-            elif same_display_price(risk_net, history_p25):
-                lines.append(
-                    f"风险倒余额比例：{float(risk_ratio):.2%}"
-                    "（七日历史 P25 为风险底价）"
-                )
-            else:
-                risk_net_text = (
-                    f"（风险底价 ¥{float(risk_net):.2f}）"
-                    if risk_net is not None else ""
-                )
-                lines.append(
-                    f"风险倒余额比例：{float(risk_ratio):.2%}{risk_net_text}"
-                )
-            for reason in (risk.get("reasons") or [])[:3]:
-                lines.append(f"- {reason}")
-        else:
-            lines.append("风险评估：不可用")
-        lines.extend([
-            f"数据更新时间：{source_time}", f"SMIS：{data['links']['smis']}",
-            f"Steam：{data['links']['steam']}",
-        ])
-        if data.get("warning"):
-            lines.append(f"警告：{data['warning']}")
-        return "\n".join(lines)
+        return format_quote(data)
 
     @filter.command_group("skin")
     def skin():
@@ -290,7 +167,10 @@ class SteamSkinOpsPlugin(Star):
     async def list_items(self, event: AstrMessageEvent):
         """列出已配置饰品。"""
         try:
-            rows = await self._call(self._require_manager().list_items)
+            rows = await self._call(
+                self._require_manager().list_items,
+                event.unified_msg_origin,
+            )
             if not rows:
                 yield event.plain_result("尚未配置饰品。管理员可使用 /skin rule add 添加规则。")
                 return
@@ -301,22 +181,7 @@ class SteamSkinOpsPlugin(Star):
             yield event.plain_result(f"查询失败：{self._error_text(exc)}")
 
     async def _resolve_smis_id(self, query: str) -> int:
-        target = query.strip()
-        if target.isdigit():
-            return int(target)
-        rows = await self._call(self._require_manager().search_items, target, 10)
-        exact = [
-            row for row in rows
-            if str(row.get("name_zh") or "").casefold() == target.casefold()
-        ]
-        candidates = exact if exact else rows
-        if not candidates:
-            raise ServiceError(404, "item_not_found", "SMIS 未找到匹配饰品，请先使用 /skin search。")
-        if len(candidates) > 1:
-            lines = ["名称匹配到多个饰品，请改用 SMIS ID："]
-            lines.extend(f"{row['smis_id']} - {row['name_zh']}" for row in candidates)
-            raise ServiceError(409, "ambiguous_item", "\n".join(lines))
-        return int(candidates[0]["smis_id"])
+        return await self._call(self._require_manager().resolve_smis_id, query)
 
     @skin.group("rule")
     def rule():
@@ -335,15 +200,24 @@ class SteamSkinOpsPlugin(Star):
             if not rows:
                 yield event.plain_result("当前会话尚未配置规则。")
                 return
-            labels = {"ratio": "即时比例", "t7": "T+7预测比例", "platform": "平台买入价", "steam": "Steam清仓价"}
             lines = ["当前会话规则："]
             for row in rows:
-                active = "告警中" if row["state"].get("alert_active") else "监控中"
-                threshold = float(row["threshold"])
-                unit = "%" if row["rule_type"] in {"ratio", "t7"} else "元"
+                if row.get("operational", 1) != 1:
+                    active = "已隔离"
+                else:
+                    active = "告警中" if row["state"].get("alert_active") else "监控中"
+                definition = get_rule_definition(str(row["rule_type"]))
+                label = definition.list_label if definition else f"不支持：{row['rule_type']}"
+                try:
+                    threshold = float(row["threshold"])
+                    if not math.isfinite(threshold):
+                        raise ValueError
+                    threshold_text = f"{threshold:g}{definition.unit if definition else ''}"
+                except (TypeError, ValueError):
+                    threshold_text = "无效阈值"
                 lines.append(
                     f"#{row['id']} {row['smis_id']} - {row['cn_name']} · "
-                    f"{labels[row['rule_type']]} {threshold:g}{unit}（{active}，{row['state'].get('status')}）"
+                    f"{label} {threshold_text}（{active}，{row['state'].get('status')}）"
                 )
             yield event.plain_result("\n".join(lines))
         except Exception as exc:
@@ -362,7 +236,8 @@ class SteamSkinOpsPlugin(Star):
                 rule_type.lower(),
                 threshold,
             )
-            unit = "%" if data["rule_type"] in {"ratio", "t7"} else "元"
+            definition = get_rule_definition(str(data["rule_type"]))
+            unit = definition.unit if definition else ""
             action = data.get("action", "created")
             if action == "updated":
                 previous = float(data["previous_threshold"])

@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .manager import MonitoringManager
+from .repository import MonitorStorage
 
 Dispatch = Callable[[], Awaitable[dict[str, int]]]
 
@@ -25,6 +26,7 @@ class PluginRuntime:
     ) -> None:
         parsed = datetime.strptime(daily_summary_time, "%H:%M")
         self.manager = manager
+        self.storage: MonitorStorage = manager.storage
         self.dispatch = dispatch
         self.interval_seconds = interval_seconds
         self.max_workers = max_workers
@@ -72,8 +74,8 @@ class PluginRuntime:
                 now = datetime.now(timezone.utc)
                 today = now.astimezone(self.local_timezone).date()
                 if self._last_backup_date != today:
-                    await asyncio.to_thread(self.manager.storage.prune_snapshots, 30)
-                    await asyncio.to_thread(self.manager.backup, self.backup_dir)
+                    await asyncio.to_thread(self.storage.prune_snapshots, 30)
+                    await asyncio.to_thread(self._backup)
                     self._last_backup_date = today
             except asyncio.CancelledError:
                 raise
@@ -87,7 +89,7 @@ class PluginRuntime:
     def _next_summary(self, now: datetime) -> datetime:
         local = now.astimezone(self.local_timezone)
         target = datetime.combine(local.date(), self.daily_summary_time, self.local_timezone)
-        completed = self.manager.storage.get_metadata("daily_summary:last_date")
+        completed = self.storage.get_metadata("daily_summary:last_date")
         if local < target:
             return target
         if completed != local.date().isoformat():
@@ -119,6 +121,14 @@ class PluginRuntime:
                 self.last_daily_summary_error = str(exc)
                 await asyncio.sleep(300)
 
+    def _backup(self, retain: int = 7) -> Path:
+        destination = self.backup_dir / f"monitor-{datetime.now().strftime('%Y%m%d')}.db"
+        self.storage.backup(destination)
+        backups = sorted(self.backup_dir.glob("monitor-*.db"), reverse=True)
+        for old in backups[retain:]:
+            old.unlink(missing_ok=True)
+        return destination
+
     def status(self) -> dict:
         running = len(self.tasks) == 2 and all(not task.done() for task in self.tasks)
         return {
@@ -131,7 +141,7 @@ class PluginRuntime:
             "last_daily_summary_at": self.last_daily_summary_at,
             "last_daily_summary_ok": self.last_daily_summary_ok,
             "last_daily_summary_error": self.last_daily_summary_error,
-            "items": self.manager.storage.count_rule_items(),
-            "rules": len(self.manager.storage.list_rules()),
-            "outbox": self.manager.storage.outbox_counts(),
+            "items": self.storage.count_rule_items(),
+            "rules": len(self.storage.list_rules()),
+            "outbox": self.storage.outbox_counts(),
         }

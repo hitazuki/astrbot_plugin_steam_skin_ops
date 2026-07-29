@@ -6,7 +6,11 @@ from datetime import datetime, timedelta, timezone
 from statistics import median, stdev, variance
 from typing import Any
 
-from .market import MarketSnapshot, steam_net_amount
+from .market import (
+    MAX_SOURCE_FUTURE_SKEW_SECONDS,
+    MarketSnapshot,
+    steam_net_amount,
+)
 
 FORECAST_DAYS = 7
 FORECAST_WINDOW_DAYS = 21
@@ -58,7 +62,10 @@ def _grid_time(value: datetime) -> datetime:
 
 
 def canonical_two_hour_rows(
-    rows: list[dict[str, Any]], now: datetime | None = None,
+    rows: list[dict[str, Any]],
+    now: datetime | None = None,
+    *,
+    max_current_lag_seconds: int | None = None,
 ) -> list[dict[str, Any]]:
     """Merge history and successful observations on a fixed two-hour grid."""
     current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -66,9 +73,21 @@ def canonical_two_hour_rows(
     buckets: dict[datetime, tuple[int, datetime, dict[str, Any]]] = {}
     for row in rows:
         kind = str(row.get("kind") or "history")
-        event_time = _parse_time(
-            row["observed_at"] if kind == "current" else row["source_updated_at"]
-        )
+        try:
+            if kind == "current":
+                event_time = _parse_time(row["observed_at"])
+                if max_current_lag_seconds is not None:
+                    source_time = _parse_time(row["source_updated_at"])
+                    lag_seconds = (event_time - source_time).total_seconds()
+                    if (
+                        lag_seconds < -MAX_SOURCE_FUTURE_SKEW_SECONDS
+                        or lag_seconds > max(0, int(max_current_lag_seconds))
+                    ):
+                        continue
+            else:
+                event_time = _parse_time(row["source_updated_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
         if event_time < cutoff or event_time > current_time + timedelta(minutes=5):
             continue
         bucket = _grid_time(event_time)
@@ -81,6 +100,47 @@ def canonical_two_hour_rows(
         {**candidate[2], "_grid_at": bucket.isoformat()}
         for bucket, candidate in sorted(buckets.items())
     ]
+
+
+def has_usable_history_coverage(
+    rows: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    max_current_lag_seconds: int,
+    required_days: int = 29,
+    min_coverage: float = MIN_COVERAGE,
+) -> bool:
+    """Return whether cache coverage is sufficient to skip upstream backfill."""
+    current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    usable_rows: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            price = float(row.get("steam_sell_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(price) and price > 0:
+            usable_rows.append(row)
+    grid = canonical_two_hour_rows(
+        usable_rows,
+        now=current_time,
+        max_current_lag_seconds=max_current_lag_seconds,
+    )
+    if not grid:
+        return False
+    timestamps = [_parse_time(row["_grid_at"]) for row in grid]
+    window_start = current_time - timedelta(days=max(1, int(required_days)))
+    bucket_seconds = GRID_HOURS * 3600
+    if min(timestamps) > window_start + timedelta(seconds=bucket_seconds):
+        return False
+    recent_tolerance = max(bucket_seconds * 2, int(max_current_lag_seconds) * 2)
+    if max(timestamps) < current_time - timedelta(seconds=recent_tolerance):
+        return False
+    relevant = [timestamp for timestamp in timestamps if timestamp >= window_start]
+    expected = max(
+        1,
+        math.ceil(max(1, int(required_days)) * 86400 / bucket_seconds),
+    )
+    return len(relevant) / expected >= float(min_coverage)
 
 
 def _daily_price_points(rows: list[dict[str, Any]]) -> list[tuple[datetime, float]]:
@@ -287,9 +347,157 @@ def _coverage(
     return min(1.0, len(relevant) / expected), span_days
 
 
+def _forecast_candidates(
+    daily: list[tuple[datetime, float]],
+) -> list[tuple[str, int]]:
+    candidates = [
+        ("persistence", 0), ("recent_level", 3),
+        ("theil_sen_linear", 14), ("theil_sen_log", 14),
+    ]
+    if len(daily) >= FORECAST_WINDOW_DAYS:
+        candidates.extend([
+            ("theil_sen_linear", 21), ("theil_sen_log", 21),
+        ])
+    return candidates
+
+
+def _evaluate_forecast_candidate(
+    daily: list[tuple[datetime, float]], mode: str, window: int,
+    common_validation_window: int, current_steam_net: float,
+) -> dict[str, Any] | None:
+    target = daily[-1][0] + timedelta(days=FORECAST_DAYS)
+    predicted = _candidate_prediction(daily, mode, window, target)
+    if predicted is None:
+        return None
+
+    error, pairs, baseline_error = _validation_score(
+        daily, mode, window, common_validation_window
+    )
+    valid = True
+    diagnostics: dict[str, Any] = {}
+    rejection_reasons: list[str] = []
+    if mode.startswith("theil_sen"):
+        valid, diagnostics, rejection_reasons = _trend_diagnostics(
+            daily, mode, window, current_steam_net
+        )
+
+    improvement = None
+    if error is not None and baseline_error and baseline_error > 0:
+        improvement = 1 - error / baseline_error
+    if mode != "persistence" and pairs >= MIN_VALIDATION_PAIRS:
+        if improvement is None or improvement < MIN_MODEL_IMPROVEMENT:
+            valid = False
+            rejection_reasons.append("相对持平模式的验证改善不足 5%")
+
+    return {
+        "mode": mode, "window": window, "predicted": predicted,
+        "error": error, "pairs": pairs, "improvement": improvement,
+        "valid": valid, "diagnostics": diagnostics,
+        "rejection_reasons": rejection_reasons,
+    }
+
+
+def _evaluate_forecast_candidates(
+    daily: list[tuple[datetime, float]], current_steam_net: float,
+) -> list[dict[str, Any]]:
+    common_validation_window = (
+        FORECAST_WINDOW_DAYS
+        if len(daily) >= FORECAST_WINDOW_DAYS else MIN_FORECAST_DAYS
+    )
+    evaluated = []
+    for mode, window in _forecast_candidates(daily):
+        candidate = _evaluate_forecast_candidate(
+            daily, mode, window, common_validation_window, current_steam_net
+        )
+        if candidate is not None:
+            evaluated.append(candidate)
+    return evaluated
+
+
+def _select_forecast_candidate(
+    evaluated: list[dict[str, Any]],
+) -> dict[str, Any]:
+    persistence = next(row for row in evaluated if row["mode"] == "persistence")
+    eligible = [row for row in evaluated if row["valid"]]
+    validated = [
+        row for row in eligible
+        if row["pairs"] >= MIN_VALIDATION_PAIRS and row["error"] is not None
+    ]
+    non_baseline = [row for row in validated if row["mode"] != "persistence"]
+    if non_baseline:
+        return min(non_baseline, key=lambda row: row["error"])
+
+    diagnostic_trends = [
+        row for row in eligible
+        if row["mode"].startswith("theil_sen")
+    ]
+    if diagnostic_trends and not validated:
+        return min(
+            diagnostic_trends,
+            key=lambda row: float(row["diagnostics"].get("residual_mad", 1e9)),
+        )
+
+    recent = next(
+        (row for row in eligible if row["mode"] == "recent_level"), None
+    )
+    return recent if recent and recent in validated else persistence
+
+
+def _forecast_reasons(
+    selected: dict[str, Any], evaluated: list[dict[str, Any]],
+) -> list[str]:
+    reasons = [
+        f"{selected['window']} 日{MODE_LABELS[selected['mode']]}"
+        if selected["window"] else MODE_LABELS[selected["mode"]]
+    ]
+    if selected["improvement"] is not None and selected["mode"] != "persistence":
+        reasons.append(f"验证误差较持平模式改善 {selected['improvement']:.1%}")
+    rejected = [
+        reason
+        for row in evaluated if not row["valid"]
+        for reason in row["rejection_reasons"]
+    ]
+    if selected["mode"] in {"persistence", "recent_level"} and rejected:
+        reasons.append(rejected[0])
+    return reasons[:3]
+
+
+def _assemble_forecast_result(
+    base: dict[str, Any], selected: dict[str, Any],
+    evaluated: list[dict[str, Any]], snapshot: MarketSnapshot,
+    lowest: tuple[str, float, int] | None, span_days: int,
+) -> dict[str, Any]:
+    predicted = float(selected["predicted"])
+    change = predicted / snapshot.steam_net - 1
+    ratio = float(lowest[1]) / predicted if lowest and predicted > 0 else None
+    normal_confidence = (
+        span_days >= FORECAST_WINDOW_DAYS
+        and selected["pairs"] >= MIN_VALIDATION_PAIRS
+    )
+    return {
+        **base,
+        "status": "ready",
+        "mode": selected["mode"],
+        "mode_label": MODE_LABELS[selected["mode"]],
+        "window_days": selected["window"],
+        "confidence": "normal" if normal_confidence else "low",
+        "predicted_steam_net": round(predicted, 4),
+        "change_pct": round(change * 100, 2),
+        "forecast_balance_ratio": round(ratio, 4) if ratio is not None else None,
+        "validation_error_pct": (
+            round(float(selected["error"]) * 100, 2)
+            if selected["error"] is not None else None
+        ),
+        "validation_sample_count": selected["pairs"],
+        "diagnostics": selected["diagnostics"],
+        "reasons": _forecast_reasons(selected, evaluated),
+    }
+
+
 def forecast_seven_days(
     rows: list[dict[str, Any]], snapshot: MarketSnapshot, *,
     stale: bool = False, now: datetime | None = None,
+    max_current_lag_seconds: int | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[tuple[datetime, float]]]:
     base = {
         "status": "unavailable",
@@ -320,7 +528,11 @@ def forecast_seven_days(
     if snapshot.steam_net <= 0:
         return {**base, "status": "price_missing", "reasons": ["当前 Steam 价格不足"]}, [], []
 
-    grid = canonical_two_hour_rows(rows, now=now or snapshot.observed_at)
+    grid = canonical_two_hour_rows(
+        rows,
+        now=now or snapshot.observed_at,
+        max_current_lag_seconds=max_current_lag_seconds,
+    )
     daily = _daily_price_points(grid)
     coverage, span_days = _coverage(grid, daily)
     base.update({"actual_window_days": span_days, "coverage": round(coverage, 4)})
@@ -335,113 +547,11 @@ def forecast_seven_days(
             "reasons": ["两小时行情覆盖不足 80%"],
         }, grid, daily
 
-    candidates: list[tuple[str, int]] = [
-        ("persistence", 0), ("recent_level", 3),
-        ("theil_sen_linear", 14), ("theil_sen_log", 14),
-    ]
-    if len(daily) >= FORECAST_WINDOW_DAYS:
-        candidates.extend([
-            ("theil_sen_linear", 21), ("theil_sen_log", 21),
-        ])
-    common_validation_window = (
-        FORECAST_WINDOW_DAYS
-        if len(daily) >= FORECAST_WINDOW_DAYS else MIN_FORECAST_DAYS
-    )
-
-    evaluated: list[dict[str, Any]] = []
-    for mode, window in candidates:
-        target = daily[-1][0] + timedelta(days=FORECAST_DAYS)
-        predicted = _candidate_prediction(daily, mode, window, target)
-        if predicted is None:
-            continue
-        error, pairs, baseline_error = _validation_score(
-            daily, mode, window, common_validation_window
-        )
-        valid = True
-        diagnostics: dict[str, Any] = {}
-        rejection_reasons: list[str] = []
-        if mode.startswith("theil_sen"):
-            valid, diagnostics, rejection_reasons = _trend_diagnostics(
-                daily, mode, window, snapshot.steam_net
-            )
-        improvement = None
-        if error is not None and baseline_error and baseline_error > 0:
-            improvement = 1 - error / baseline_error
-        if mode != "persistence" and pairs >= MIN_VALIDATION_PAIRS:
-            if improvement is None or improvement < MIN_MODEL_IMPROVEMENT:
-                valid = False
-                rejection_reasons.append("相对持平模式的验证改善不足 5%")
-        evaluated.append({
-            "mode": mode, "window": window, "predicted": predicted,
-            "error": error, "pairs": pairs, "improvement": improvement,
-            "valid": valid, "diagnostics": diagnostics,
-            "rejection_reasons": rejection_reasons,
-        })
-
-    persistence = next(row for row in evaluated if row["mode"] == "persistence")
-    eligible = [row for row in evaluated if row["valid"]]
-    validated = [
-        row for row in eligible
-        if row["pairs"] >= MIN_VALIDATION_PAIRS and row["error"] is not None
-    ]
-    non_baseline = [row for row in validated if row["mode"] != "persistence"]
-    if non_baseline:
-        selected = min(non_baseline, key=lambda row: row["error"])
-    else:
-        diagnostic_trends = [
-            row for row in eligible
-            if row["mode"].startswith("theil_sen")
-        ]
-        if diagnostic_trends and not validated:
-            selected = min(
-                diagnostic_trends,
-                key=lambda row: float(row["diagnostics"].get("residual_mad", 1e9)),
-            )
-        else:
-            recent = next(
-                (row for row in eligible if row["mode"] == "recent_level"), None
-            )
-            selected = recent if recent and recent in validated else persistence
-
-    predicted = float(selected["predicted"])
-    change = predicted / snapshot.steam_net - 1
-    ratio = float(lowest[1]) / predicted if lowest and predicted > 0 else None
-    normal_confidence = (
-        span_days >= FORECAST_WINDOW_DAYS
-        and selected["pairs"] >= MIN_VALIDATION_PAIRS
-    )
-    reasons = [
-        f"{selected['window']} 日{MODE_LABELS[selected['mode']]}"
-        if selected["window"] else MODE_LABELS[selected["mode"]]
-    ]
-    if selected["improvement"] is not None and selected["mode"] != "persistence":
-        reasons.append(f"验证误差较持平模式改善 {selected['improvement']:.1%}")
-    rejected = [
-        reason
-        for row in evaluated if not row["valid"]
-        for reason in row["rejection_reasons"]
-    ]
-    if selected["mode"] in {"persistence", "recent_level"} and rejected:
-        reasons.append(rejected[0])
-
-    return {
-        **base,
-        "status": "ready",
-        "mode": selected["mode"],
-        "mode_label": MODE_LABELS[selected["mode"]],
-        "window_days": selected["window"],
-        "confidence": "normal" if normal_confidence else "low",
-        "predicted_steam_net": round(predicted, 4),
-        "change_pct": round(change * 100, 2),
-        "forecast_balance_ratio": round(ratio, 4) if ratio is not None else None,
-        "validation_error_pct": (
-            round(float(selected["error"]) * 100, 2)
-            if selected["error"] is not None else None
-        ),
-        "validation_sample_count": selected["pairs"],
-        "diagnostics": selected["diagnostics"],
-        "reasons": reasons[:3],
-    }, grid, daily
+    evaluated = _evaluate_forecast_candidates(daily, snapshot.steam_net)
+    selected = _select_forecast_candidate(evaluated)
+    return _assemble_forecast_result(
+        base, selected, evaluated, snapshot, lowest, span_days
+    ), grid, daily
 
 
 def _change(rows: list[dict[str, Any]], field: str, days: int = 7) -> float | None:
@@ -498,10 +608,10 @@ def _volume_metrics(
     return recent_median, change, len(recent), len(prior)
 
 
-def assess_risk(
-    grid: list[dict[str, Any]], daily: list[tuple[datetime, float]],
-    snapshot: MarketSnapshot, t7_stats: dict[str, Any], forecast: dict[str, Any],
-) -> dict[str, Any]:
+def _risk_floor_metrics(
+    snapshot: MarketSnapshot, t7_stats: dict[str, Any],
+    forecast: dict[str, Any],
+) -> tuple[float | None, float | None, float | None]:
     lowest = snapshot.lowest_platform
     p25 = t7_stats.get("t7_steam_net_p25")
     predicted = (
@@ -524,57 +634,62 @@ def assess_risk(
         platform_price / float(p25)
         if platform_price is not None and p25 is not None and float(p25) > 0 else None
     )
-    ratio_delta = risk_ratio - t7_ratio if risk_ratio is not None and t7_ratio is not None else None
+    ratio_delta = (
+        risk_ratio - t7_ratio
+        if risk_ratio is not None and t7_ratio is not None else None
+    )
+    return risk_net, risk_ratio, ratio_delta
 
-    last_day = daily[-1][0] if daily else snapshot.observed_at.replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    volume_median, volume_change, recent_volume_days, prior_volume_days = _volume_metrics(
-        grid, last_day
-    )
-    forecast_change = (
-        float(forecast["change_pct"]) / 100
-        if forecast.get("change_pct") is not None else None
-    )
 
+def _assess_price_risk(
+    forecast_change: float | None, ratio_delta: float | None,
+    volume_change: float | None,
+) -> dict[str, Any]:
     price_reasons: list[str] = []
     if forecast_change is None and ratio_delta is None:
-        price = _dimension("unavailable", "unknown", {}, ["预测与比例数据不足"])
-    else:
-        level = "low"
-        if forecast_change is not None:
-            if forecast_change <= -0.05:
-                level = "high"
-                price_reasons.append(f"预计七日下跌 {abs(forecast_change):.1%}")
-            elif forecast_change <= -0.02:
-                level = "medium"
-                price_reasons.append(f"预计七日下跌 {abs(forecast_change):.1%}")
-        if ratio_delta is not None and ratio_delta >= 0.02:
-            if LEVEL_ORDER[level] < LEVEL_ORDER["medium"]:
-                level = "medium"
-            price_reasons.append(f"风险比例较 P25 比例高 {ratio_delta:.1%}")
-        if forecast_change is not None and volume_change is not None:
-            if forecast_change <= -0.02 and volume_change >= 0.10:
-                level = _upgrade(level)
-                price_reasons.append(f"下跌同时成交量增加 {volume_change:.1%}")
-        if not price_reasons:
-            price_reasons.append("未发现明显价格下行压力")
-        price = _dimension(
-            "ready" if forecast_change is not None else "partial", level,
-            {
-                "forecast_change_pct": (
-                    round(forecast_change * 100, 2) if forecast_change is not None else None
-                ),
-                "risk_vs_t7_ratio_delta_pct": (
-                    round(ratio_delta * 100, 2) if ratio_delta is not None else None
-                ),
-                "volume_confirmation": bool(
-                    forecast_change is not None and volume_change is not None
-                    and forecast_change <= -0.02 and volume_change >= 0.10
-                ),
-            }, price_reasons,
+        return _dimension(
+            "unavailable", "unknown", {}, ["预测与比例数据不足"]
         )
 
+    level = "low"
+    if forecast_change is not None:
+        if forecast_change <= -0.05:
+            level = "high"
+            price_reasons.append(f"预计七日下跌 {abs(forecast_change):.1%}")
+        elif forecast_change <= -0.02:
+            level = "medium"
+            price_reasons.append(f"预计七日下跌 {abs(forecast_change):.1%}")
+    if ratio_delta is not None and ratio_delta >= 0.02:
+        if LEVEL_ORDER[level] < LEVEL_ORDER["medium"]:
+            level = "medium"
+        price_reasons.append(f"风险比例较 P25 比例高 {ratio_delta:.1%}")
+    if forecast_change is not None and volume_change is not None:
+        if forecast_change <= -0.02 and volume_change >= 0.10:
+            level = _upgrade(level)
+            price_reasons.append(f"下跌同时成交量增加 {volume_change:.1%}")
+    if not price_reasons:
+        price_reasons.append("未发现明显价格下行压力")
+    return _dimension(
+        "ready" if forecast_change is not None else "partial", level,
+        {
+            "forecast_change_pct": (
+                round(forecast_change * 100, 2)
+                if forecast_change is not None else None
+            ),
+            "risk_vs_t7_ratio_delta_pct": (
+                round(ratio_delta * 100, 2) if ratio_delta is not None else None
+            ),
+            "volume_confirmation": bool(
+                forecast_change is not None and volume_change is not None
+                and forecast_change <= -0.02 and volume_change >= 0.10
+            ),
+        }, price_reasons,
+    )
+
+
+def _assess_volatility_risk(
+    daily: list[tuple[datetime, float]],
+) -> dict[str, Any]:
     returns = [
         math.log(second / first)
         for first, second in zip(
@@ -584,141 +699,175 @@ def assess_risk(
     recent_returns = returns[-7:]
     prior_returns = returns[-14:-7]
     if len(recent_returns) < 4:
-        volatility = _dimension("unavailable", "unknown", {}, ["日收益数据不足"])
-    else:
-        recent_variance = variance(recent_returns) if len(recent_returns) >= 2 else 0.0
-        sigma7 = stdev(recent_returns) * math.sqrt(7) if len(recent_returns) >= 2 else 0.0
-        prior_variance = variance(prior_returns) if len(prior_returns) >= 2 else None
-        variance_ratio = None
-        if prior_variance is not None:
-            variance_ratio = (
-                recent_variance / prior_variance
-                if prior_variance > 1e-12 else (math.inf if recent_variance > 1e-12 else 1.0)
-            )
-        level = "high" if sigma7 >= 0.07 else "medium" if sigma7 >= 0.03 else "low"
-        volatility_reasons = [f"七日波动率 {sigma7:.1%}"]
-        if variance_ratio is not None and variance_ratio >= 1.5 and sigma7 >= 0.02:
-            level = _upgrade(level)
-            volatility_reasons.append(f"近期方差放大 {variance_ratio:.2f} 倍")
-        volatility = _dimension(
-            "ready" if prior_variance is not None else "partial", level,
-            {
-                "daily_log_return_variance": round(recent_variance, 8),
-                "realized_volatility_7d_pct": round(sigma7 * 100, 2),
-                "variance_ratio_7d_vs_prior7d": (
-                    None if variance_ratio is None or math.isinf(variance_ratio)
-                    else round(variance_ratio, 4)
-                ),
-                "variance_ratio_infinite": bool(
-                    variance_ratio is not None and math.isinf(variance_ratio)
-                ),
-            }, volatility_reasons,
+        return _dimension(
+            "unavailable", "unknown", {}, ["日收益数据不足"]
         )
 
+    recent_variance = (
+        variance(recent_returns) if len(recent_returns) >= 2 else 0.0
+    )
+    sigma7 = (
+        stdev(recent_returns) * math.sqrt(7)
+        if len(recent_returns) >= 2 else 0.0
+    )
+    prior_variance = variance(prior_returns) if len(prior_returns) >= 2 else None
+    variance_ratio = None
+    if prior_variance is not None:
+        variance_ratio = (
+            recent_variance / prior_variance
+            if prior_variance > 1e-12
+            else (math.inf if recent_variance > 1e-12 else 1.0)
+        )
+    level = "high" if sigma7 >= 0.07 else "medium" if sigma7 >= 0.03 else "low"
+    volatility_reasons = [f"七日波动率 {sigma7:.1%}"]
+    if variance_ratio is not None and variance_ratio >= 1.5 and sigma7 >= 0.02:
+        level = _upgrade(level)
+        volatility_reasons.append(f"近期方差放大 {variance_ratio:.2f} 倍")
+    return _dimension(
+        "ready" if prior_variance is not None else "partial", level,
+        {
+            "daily_log_return_variance": round(recent_variance, 8),
+            "realized_volatility_7d_pct": round(sigma7 * 100, 2),
+            "variance_ratio_7d_vs_prior7d": (
+                None if variance_ratio is None or math.isinf(variance_ratio)
+                else round(variance_ratio, 4)
+            ),
+            "variance_ratio_infinite": bool(
+                variance_ratio is not None and math.isinf(variance_ratio)
+            ),
+        }, volatility_reasons,
+    )
+
+
+def _stock_flow_change(
+    grid: list[dict[str, Any]], stock_flow_now: float | None,
+) -> float | None:
+    if not grid or stock_flow_now is None:
+        return None
+    cutoff = _parse_time(grid[-1]["_grid_at"]) - timedelta(days=7)
+    prior = min(
+        grid,
+        key=lambda row: abs((_parse_time(row["_grid_at"]) - cutoff).total_seconds()),
+    )
+    prior_flow = _stock_flow(prior)
+    if prior_flow is not None and abs(
+        (_parse_time(prior["_grid_at"]) - cutoff).total_seconds()
+    ) <= GRID_HOURS * 2 * 3600:
+        return stock_flow_now / prior_flow - 1
+    return None
+
+
+def _assess_inventory_risk(grid: list[dict[str, Any]]) -> dict[str, Any]:
     steam_inventory_change = _change(grid, "steam_sell_num")
     buff_inventory_change = _change(grid, "buff_sell_num")
     stock_flow_now = _stock_flow(grid[-1]) if grid else None
-    stock_flow_change = None
-    if grid and stock_flow_now is not None:
-        cutoff = _parse_time(grid[-1]["_grid_at"]) - timedelta(days=7)
-        prior = min(
-            grid,
-            key=lambda row: abs((_parse_time(row["_grid_at"]) - cutoff).total_seconds()),
-        )
-        prior_flow = _stock_flow(prior)
-        if prior_flow is not None and abs(
-            (_parse_time(prior["_grid_at"]) - cutoff).total_seconds()
-        ) <= GRID_HOURS * 2 * 3600:
-            stock_flow_change = stock_flow_now / prior_flow - 1
+    stock_flow_change = _stock_flow_change(grid, stock_flow_now)
     inventory_values = [steam_inventory_change, buff_inventory_change, stock_flow_change]
     if all(value is None for value in inventory_values):
-        inventory = _dimension("unavailable", "unknown", {}, ["库存历史不足"])
-    else:
-        pressure = sum([
-            steam_inventory_change is not None and steam_inventory_change >= 0.05,
-            buff_inventory_change is not None and buff_inventory_change >= 0.05,
-            stock_flow_change is not None and stock_flow_change >= 0.10,
-        ])
-        severe = any([
-            steam_inventory_change is not None and steam_inventory_change >= 0.15,
-            buff_inventory_change is not None and buff_inventory_change >= 0.15,
-            stock_flow_change is not None and stock_flow_change >= 0.25,
-        ])
-        level = "high" if severe or pressure >= 2 else "medium" if pressure == 1 else "low"
-        inventory_reasons = []
-        if steam_inventory_change is not None and steam_inventory_change >= 0.05:
-            inventory_reasons.append(f"Steam 在售增加 {steam_inventory_change:.1%}")
-        if buff_inventory_change is not None and buff_inventory_change >= 0.05:
-            inventory_reasons.append(f"BUFF 在售增加 {buff_inventory_change:.1%}")
-        if stock_flow_change is not None and stock_flow_change >= 0.10:
-            inventory_reasons.append(f"库存消化天数恶化 {stock_flow_change:.1%}")
-        if not inventory_reasons:
-            inventory_reasons.append("未发现明显库存压力")
-        inventory = _dimension(
-            "ready" if all(value is not None for value in inventory_values) else "partial",
-            level,
-            {
-                "steam_sell_num_change_7d_pct": (
-                    round(steam_inventory_change * 100, 2)
-                    if steam_inventory_change is not None else None
-                ),
-                "buff_sell_num_change_7d_pct": (
-                    round(buff_inventory_change * 100, 2)
-                    if buff_inventory_change is not None else None
-                ),
-                "stock_to_flow_days": round(stock_flow_now, 2) if stock_flow_now is not None else None,
-                "stock_to_flow_change_7d_pct": (
-                    round(stock_flow_change * 100, 2) if stock_flow_change is not None else None
-                ),
-            }, inventory_reasons,
+        return _dimension(
+            "unavailable", "unknown", {}, ["库存历史不足"]
         )
 
+    pressure = sum([
+        steam_inventory_change is not None and steam_inventory_change >= 0.05,
+        buff_inventory_change is not None and buff_inventory_change >= 0.05,
+        stock_flow_change is not None and stock_flow_change >= 0.10,
+    ])
+    severe = any([
+        steam_inventory_change is not None and steam_inventory_change >= 0.15,
+        buff_inventory_change is not None and buff_inventory_change >= 0.15,
+        stock_flow_change is not None and stock_flow_change >= 0.25,
+    ])
+    level = "high" if severe or pressure >= 2 else "medium" if pressure == 1 else "low"
+    inventory_reasons = []
+    if steam_inventory_change is not None and steam_inventory_change >= 0.05:
+        inventory_reasons.append(f"Steam 在售增加 {steam_inventory_change:.1%}")
+    if buff_inventory_change is not None and buff_inventory_change >= 0.05:
+        inventory_reasons.append(f"BUFF 在售增加 {buff_inventory_change:.1%}")
+    if stock_flow_change is not None and stock_flow_change >= 0.10:
+        inventory_reasons.append(f"库存消化天数恶化 {stock_flow_change:.1%}")
+    if not inventory_reasons:
+        inventory_reasons.append("未发现明显库存压力")
+    return _dimension(
+        "ready" if all(value is not None for value in inventory_values)
+        else "partial",
+        level,
+        {
+            "steam_sell_num_change_7d_pct": (
+                round(steam_inventory_change * 100, 2)
+                if steam_inventory_change is not None else None
+            ),
+            "buff_sell_num_change_7d_pct": (
+                round(buff_inventory_change * 100, 2)
+                if buff_inventory_change is not None else None
+            ),
+            "stock_to_flow_days": (
+                round(stock_flow_now, 2) if stock_flow_now is not None else None
+            ),
+            "stock_to_flow_change_7d_pct": (
+                round(stock_flow_change * 100, 2)
+                if stock_flow_change is not None else None
+            ),
+        }, inventory_reasons,
+    )
+
+
+def _assess_volume_risk(
+    volume_median: float | None, volume_change: float | None,
+    recent_volume_days: int, prior_volume_days: int,
+    forecast_change: float | None,
+) -> dict[str, Any]:
     if volume_median is None:
-        volume = _dimension(
+        return _dimension(
             "unavailable", "unknown",
             {"recent_days": recent_volume_days, "prior_days": prior_volume_days},
             ["两个七日区间的成交量有效日不足 5 天"],
         )
-    else:
-        level = "low"
-        volume_reasons = []
-        if volume_median == 0:
-            level = "high"
-            volume_reasons.append("最近七日成交量为零")
-        elif volume_change is not None and volume_change <= -0.25:
-            level = "high"
-            volume_reasons.append(f"成交量下降 {abs(volume_change):.1%}")
-        elif volume_change is not None and volume_change <= -0.10:
-            level = "medium"
-            volume_reasons.append(f"成交量下降 {abs(volume_change):.1%}")
-        if forecast_change is not None and volume_change is not None:
-            if forecast_change <= -0.05 and volume_change >= 0.20:
-                level = "high"
-                volume_reasons.append("显著放量下跌")
-            elif forecast_change <= -0.02 and volume_change >= 0.10:
-                if LEVEL_ORDER[level] < LEVEL_ORDER["medium"]:
-                    level = "medium"
-                volume_reasons.append("放量下跌")
-        if not volume_reasons:
-            volume_reasons.append("成交量未显示明显流动性或卖压风险")
-        volume = _dimension(
-            "ready", level,
-            {
-                "median_7d": round(volume_median, 2),
-                "change_vs_prior7d_pct": (
-                    round(volume_change * 100, 2) if volume_change is not None else None
-                ),
-                "recent_days": recent_volume_days,
-                "prior_days": prior_volume_days,
-            }, volume_reasons,
-        )
 
-    dimensions = {
-        "price": price, "volatility": volatility,
-        "inventory": inventory, "volume": volume,
-    }
+    level = "low"
+    volume_reasons = []
+    if volume_median == 0:
+        level = "high"
+        volume_reasons.append("最近七日成交量为零")
+    elif volume_change is not None and volume_change <= -0.25:
+        level = "high"
+        volume_reasons.append(f"成交量下降 {abs(volume_change):.1%}")
+    elif volume_change is not None and volume_change <= -0.10:
+        level = "medium"
+        volume_reasons.append(f"成交量下降 {abs(volume_change):.1%}")
+    if forecast_change is not None and volume_change is not None:
+        if forecast_change <= -0.05 and volume_change >= 0.20:
+            level = "high"
+            volume_reasons.append("显著放量下跌")
+        elif forecast_change <= -0.02 and volume_change >= 0.10:
+            if LEVEL_ORDER[level] < LEVEL_ORDER["medium"]:
+                level = "medium"
+            volume_reasons.append("放量下跌")
+    if not volume_reasons:
+        volume_reasons.append("成交量未显示明显流动性或卖压风险")
+    return _dimension(
+        "ready", level,
+        {
+            "median_7d": round(volume_median, 2),
+            "change_vs_prior7d_pct": (
+                round(volume_change * 100, 2)
+                if volume_change is not None else None
+            ),
+            "recent_days": recent_volume_days,
+            "prior_days": prior_volume_days,
+        }, volume_reasons,
+    )
+
+
+def _aggregate_risk(
+    dimensions: dict[str, dict[str, Any]], risk_net: float | None,
+    risk_ratio: float | None,
+) -> dict[str, Any]:
     available = [value for value in dimensions.values() if value["level"] != "unknown"]
-    overall = max(available, key=lambda value: LEVEL_ORDER[value["level"]])["level"] if available else "unknown"
+    overall = (
+        max(available, key=lambda value: LEVEL_ORDER[value["level"]])["level"]
+        if available else "unknown"
+    )
     overall_reasons = [
         value["reasons"][0]
         for value in dimensions.values()
@@ -742,13 +891,49 @@ def assess_risk(
     }
 
 
+def assess_risk(
+    grid: list[dict[str, Any]], daily: list[tuple[datetime, float]],
+    snapshot: MarketSnapshot, t7_stats: dict[str, Any], forecast: dict[str, Any],
+) -> dict[str, Any]:
+    risk_net, risk_ratio, ratio_delta = _risk_floor_metrics(
+        snapshot, t7_stats, forecast
+    )
+    last_day = daily[-1][0] if daily else snapshot.observed_at.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    volume_median, volume_change, recent_volume_days, prior_volume_days = (
+        _volume_metrics(grid, last_day)
+    )
+    forecast_change = (
+        float(forecast["change_pct"]) / 100
+        if forecast.get("change_pct") is not None else None
+    )
+    dimensions = {
+        "price": _assess_price_risk(
+            forecast_change, ratio_delta, volume_change
+        ),
+        "volatility": _assess_volatility_risk(daily),
+        "inventory": _assess_inventory_risk(grid),
+        "volume": _assess_volume_risk(
+            volume_median, volume_change, recent_volume_days,
+            prior_volume_days, forecast_change,
+        ),
+    }
+    return _aggregate_risk(dimensions, risk_net, risk_ratio)
+
+
 def forecast_and_risk(
     rows: list[dict[str, Any]], snapshot: MarketSnapshot,
     t7_stats: dict[str, Any], *, stale: bool = False,
     now: datetime | None = None,
+    max_current_lag_seconds: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     forecast, grid, daily = forecast_seven_days(
-        rows, snapshot, stale=stale, now=now
+        rows,
+        snapshot,
+        stale=stale,
+        now=now,
+        max_current_lag_seconds=max_current_lag_seconds,
     )
     if stale:
         unavailable = _dimension(
