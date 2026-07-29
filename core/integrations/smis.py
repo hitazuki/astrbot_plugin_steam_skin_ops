@@ -4,7 +4,7 @@ import base64
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -33,6 +33,16 @@ class MarketDataProvider(Protocol):
     def fetch_metadata(self, smis_id: int) -> dict[str, Any]: ...
     def fetch_current(self, item: dict[str, Any]) -> MarketSnapshot: ...
     def fetch_history(self, item: dict[str, Any], days: int = 30) -> list[MarketSnapshot]: ...
+    def fetch_exchange_candidates(
+        self,
+        *,
+        min_price: float,
+        max_price: float,
+        min_transaction_quantity: int,
+        max_ratio: float,
+        max_age_minutes: int,
+        limit: int = 50,
+    ) -> list[MarketSnapshot]: ...
 
 
 class SmisClient:
@@ -47,6 +57,18 @@ class SmisClient:
         "steamTransactionQuantity",
         "buffExchangeSteamBySell",
     )
+    EXCHANGE_PLATFORM_SETTINGS = {
+        "buffTax": 0.015,
+        "buffLimit": 9_999_999,
+        "uuypTax": 0.01,
+        "uuypLimit": 9_999_999,
+        "c5Tax": 0.01,
+        "c5Limit": 100,
+        "igxeTax": 0.006,
+        "igxeLimit": 9_999_999,
+        "ecoTax": 0,
+        "ecoLimit": 9_999_999,
+    }
 
     def __init__(
         self,
@@ -281,6 +303,84 @@ class SmisClient:
             if len(results) >= max(1, min(int(limit), 20)):
                 break
         return results
+
+    def fetch_exchange_candidates(
+        self,
+        *,
+        min_price: float,
+        max_price: float,
+        min_transaction_quantity: int,
+        max_ratio: float,
+        max_age_minutes: int,
+        limit: int = 50,
+    ) -> list[MarketSnapshot]:
+        """Fetch the current SMIS platform-to-Steam exchange candidate page."""
+
+        page_size = max(1, min(int(limit), 50))
+        time_after = datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(
+            minutes=max(1, int(max_age_minutes))
+        )
+        payload = {
+            "model": 0,
+            "platforms": ["buff", "uuyp", "c5", "igxe", "eco"],
+            "appid": "730",
+            "minPrice": float(min_price),
+            "maxPrice": float(max_price),
+            "minTransactionQuantity": int(min_transaction_quantity),
+            "minRate": 0,
+            "maxRate": float(max_ratio),
+            "timeAfter": time_after.strftime("%Y-%m-%d %H:%M:%S"),
+            "pageNum": 1,
+            "pageSize": page_size,
+            **self.EXCHANGE_PLATFORM_SETTINGS,
+        }
+        data = self._request("POST", "/commodity/exchange", json=payload)
+        if not isinstance(data, list):
+            raise SmisClientError("SMIS 挂刀候选结构无效")
+
+        observed_at = datetime.now(timezone.utc)
+        snapshots: list[MarketSnapshot] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            try:
+                smis_id = int(row["id"])
+                appid = int(row["appid"])
+                name = str(row["hashName"]).strip()
+                name_zh = str(row.get("cnName") or name).strip()
+                source_updated_at = self._smis_time(row["updateTime"])
+                if smis_id <= 0 or appid <= 0 or not name or not name_zh:
+                    raise ValueError("identity")
+                snapshot = MarketSnapshot(
+                    item_key=f"smis:{smis_id}",
+                    smis_id=smis_id,
+                    appid=appid,
+                    name=name,
+                    name_zh=name_zh,
+                    observed_at=observed_at,
+                    source_updated_at=source_updated_at,
+                    buff_sell_price=float(row.get("buffSellPrice") or 0),
+                    buff_sell_num=int(row.get("buffSellNum") or 0),
+                    uuyp_sell_price=float(row.get("uuypSellPrice") or 0),
+                    uuyp_sell_num=int(row.get("uuypSellNum") or 0),
+                    c5_sell_price=float(row.get("c5SellPrice") or 0),
+                    c5_sell_num=int(row.get("c5SellNum") or 0),
+                    igxe_sell_price=float(row.get("igxeSellPrice") or 0),
+                    igxe_sell_num=int(row.get("igxeSellNum") or 0),
+                    eco_sell_price=float(row.get("ecoSellPrice") or 0),
+                    eco_sell_num=int(row.get("ecoSellNum") or 0),
+                    steam_sell_price=float(row.get("steamSellPrice") or 0),
+                    steam_sell_num=int(row.get("steamSellNum") or 0),
+                    steam_transaction_quantity=int(
+                        row.get("steamTransactionQuantity") or 0
+                    ),
+                    kind="current",
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("忽略无效的 SMIS 挂刀候选：%s", exc)
+                continue
+            snapshots.append(snapshot)
+        return snapshots
 
     def fetch_history(self, item: dict[str, Any], days: int = 30) -> list[MarketSnapshot]:
         data = self._request(

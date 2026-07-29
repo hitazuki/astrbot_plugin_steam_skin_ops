@@ -12,7 +12,8 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from .core.config import ConfigError, PluginSettings, load_settings
 from .core.integrations.smis import SmisClient
 from .core.manager import MonitoringManager, ServiceError
-from .core.presentation import format_quote
+from .core.presentation import format_quote, format_recommendations
+from .core.recommendation import RecommendationPolicy
 from .core.repository import MonitorStorage
 from .core.rules import get_rule_definition
 from .core.runtime import PluginRuntime
@@ -23,6 +24,7 @@ PLUGIN_NAME = "astrbot_plugin_steam_skin_ops"
 HELP_TEXT = """Steam Skin Ops 命令：
 /skin search <名称> - 搜索 SMIS 饰品 ID
 /skin quote <SMIS_ID|名称> - 全市场即时查询
+/skin recommend [预算上限] - 确定性即时挂刀 Top 5
 /skin rule add <SMIS_ID|名称> <ratio|t7|platform|steam> <阈值>
 /skin rule list [SMIS_ID] - 当前会话规则
 /skin rule set <RULE_ID> <新阈值>
@@ -63,6 +65,13 @@ class SteamSkinOpsPlugin(Star):
             quote_cache_seconds=self.settings.quote_cache_seconds,
             breakthrough_step_percent=self.settings.breakthrough_step_percent,
             poll_interval_seconds=self.settings.interval_seconds,
+            recommendation_policy=RecommendationPolicy(
+                min_price=self.settings.recommend_min_price,
+                max_price=self.settings.recommend_max_price,
+                max_ratio=self.settings.recommend_max_ratio_percent / 100,
+                min_steam_volume=self.settings.recommend_min_steam_volume,
+                max_source_age_minutes=self.settings.recommend_max_age_minutes,
+            ),
         )
         self._dispatch_lock = asyncio.Lock()
         self.runtime = PluginRuntime(
@@ -162,6 +171,19 @@ class SteamSkinOpsPlugin(Star):
             yield event.plain_result("\n".join(lines))
         except Exception as exc:
             yield event.plain_result(f"搜索失败：{self._error_text(exc)}")
+
+    @skin.command("recommend")
+    async def recommend_items(
+        self,
+        event: AstrMessageEvent,
+        budget: float | None = None,
+    ):
+        """按确定性即时策略推荐最多五个挂刀候选。"""
+        try:
+            data = await self._call(self._require_manager().recommend, budget)
+            yield event.plain_result(format_recommendations(data))
+        except Exception as exc:
+            yield event.plain_result(f"推荐失败：{self._error_text(exc)}")
 
     @skin.command("items")
     async def list_items(self, event: AstrMessageEvent):

@@ -19,6 +19,11 @@ class PluginSettings:
     smis_timeout_seconds: float = 15.0
     smis_max_retries: int = 3
     smis_min_request_interval_seconds: float = 1.0
+    recommend_min_price: float = 30.0
+    recommend_max_price: float = 5000.0
+    recommend_max_ratio_percent: float = 80.0
+    recommend_min_steam_volume: int = 50
+    recommend_max_age_minutes: int = 120
 
 
 class ConfigError(ValueError):
@@ -89,11 +94,45 @@ def load_settings(config: Mapping[str, Any]) -> PluginSettings:
             float,
             errors,
         ),
+        recommend_min_price=_positive(
+            config.get("recommend_min_price", 30),
+            "recommend_min_price",
+            float,
+            errors,
+        ),
+        recommend_max_price=_positive(
+            config.get("recommend_max_price", 5000),
+            "recommend_max_price",
+            float,
+            errors,
+        ),
+        recommend_max_ratio_percent=_positive(
+            config.get("recommend_max_ratio_percent", 80),
+            "recommend_max_ratio_percent",
+            float,
+            errors,
+        ),
+        recommend_min_steam_volume=_positive(
+            config.get("recommend_min_steam_volume", 50),
+            "recommend_min_steam_volume",
+            int,
+            errors,
+        ),
+        recommend_max_age_minutes=_positive(
+            config.get("recommend_max_age_minutes", 120),
+            "recommend_max_age_minutes",
+            int,
+            errors,
+        ),
     )
     if settings.max_workers > 8:
         errors.append("max_workers 不能大于 8")
     if settings.max_items > 200:
         errors.append("max_items 不能大于 200")
+    if settings.recommend_max_price < settings.recommend_min_price:
+        errors.append("recommend_max_price 不能小于 recommend_min_price")
+    if settings.recommend_max_ratio_percent > 100:
+        errors.append("recommend_max_ratio_percent 不能大于 100")
     if errors:
         raise ConfigError(errors)
     return settings

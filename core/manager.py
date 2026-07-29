@@ -19,6 +19,7 @@ from .presentation import (
     format_breakthrough_alert,
     format_rule_alert,
 )
+from .recommendation import RecommendationPolicy, rank_recommendations
 from .repository import MonitorStorage, RuleItemLimitError
 from .risk import forecast_and_risk
 from .rules import (
@@ -78,6 +79,7 @@ class MonitoringManager:
         health_failure_threshold: int = 3,
         breakthrough_step_percent: float = 3,
         poll_interval_seconds: int = 1800,
+        recommendation_policy: RecommendationPolicy | None = None,
     ) -> None:
         self.storage = storage
         self.source = source
@@ -88,6 +90,7 @@ class MonitoringManager:
         self.clear_confirmations = max(1, int(clear_confirmations))
         self.health_failure_threshold = max(1, int(health_failure_threshold))
         self.poll_interval_seconds = max(1, int(poll_interval_seconds))
+        self.recommendation_policy = recommendation_policy or RecommendationPolicy()
         self.history_backfiller = HistoryBackfiller(
             storage,
             source,
@@ -268,6 +271,29 @@ class MonitoringManager:
         except Exception as exc:
             logger.warning("SMIS 搜索失败：%s", exc)
             raise ServiceError(503, "smis_search_failed", "SMIS 搜索暂时不可用") from exc
+
+    def recommend(self, budget: float | None = None) -> dict:
+        try:
+            policy = self.recommendation_policy.with_budget(budget)
+        except ValueError as exc:
+            raise ServiceError(422, "invalid_budget", str(exc)) from exc
+        try:
+            snapshots = self.source.fetch_exchange_candidates(
+                min_price=policy.min_price,
+                max_price=policy.max_price,
+                min_transaction_quantity=policy.min_steam_volume,
+                max_ratio=policy.max_ratio,
+                max_age_minutes=policy.max_source_age_minutes,
+                limit=policy.candidate_limit,
+            )
+        except Exception as exc:
+            logger.warning("SMIS 挂刀候选查询失败：%s", exc)
+            raise ServiceError(
+                503,
+                "recommendation_source_unavailable",
+                "SMIS 挂刀候选暂时不可用",
+            ) from exc
+        return rank_recommendations(snapshots, policy)
 
     @staticmethod
     def _validate_rule(rule_type: str, threshold: float) -> None:

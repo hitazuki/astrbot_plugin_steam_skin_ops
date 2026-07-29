@@ -17,6 +17,7 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 ```text
 /skin search <名称>                         搜索 SMIS 饰品 ID
 /skin quote <SMIS_ID|名称>                 查询全市场报价和风险
+/skin recommend [预算上限]                 确定性即时挂刀 Top 5
 /skin items                                查看已监控饰品
 /skin rule list [SMIS_ID]                  查看当前会话规则
 /skin rule add <目标> <ratio|t7|platform|steam> <阈值>
@@ -27,7 +28,7 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 /skin help                                 显示帮助
 ```
 
-`search`、`quote`、`items`、`rule list` 和 `help` 对普通用户开放；修改规则、推送测试和状态管理要求 AstrBot 管理员权限。规则使用 `unified_msg_origin` 隔离，不同会话只能查看和修改自己的规则。
+`search`、`quote`、`recommend`、`items`、`rule list` 和 `help` 对普通用户开放；修改规则、推送测试和状态管理要求 AstrBot 管理员权限。规则使用 `unified_msg_origin` 隔离，不同会话只能查看和修改自己的规则。
 
 比例规则的阈值使用百分数，例如 `72` 表示 `72%`；价格规则使用人民币金额。
 
@@ -45,8 +46,29 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 | `smis_timeout_seconds` | `15` | 上游请求超时 |
 | `smis_max_retries` | `3` | 临时错误最大尝试次数 |
 | `smis_min_request_interval_seconds` | `1` | 全局请求最小间隔 |
+| `recommend_min_price` | `30` | 推荐候选最低平台买入价 |
+| `recommend_max_price` | `5000` | 推荐候选最高平台买入价，也是命令预算的配置上限 |
+| `recommend_max_ratio_percent` | `80` | 推荐候选最高即时挂刀比例 |
+| `recommend_min_steam_volume` | `50` | 推荐候选最低 Steam 日成交量 |
+| `recommend_max_age_minutes` | `120` | 推荐候选最大行情年龄 |
 
 配置不合法时插件不会启动后台任务，`/skin status` 会列出需要修复的字段。
+
+## 确定性挂刀推荐
+
+`/skin recommend` 从 SMIS 当前挂刀候选中最多读取 50 项，在本地重新计算 Steam
+预计到手价和即时挂刀比例，然后返回最多 5 项。可以提供一次性的预算上限，
+例如 `/skin recommend 500`；该金额只会收紧配置中的最高买入价，不会突破配置
+上限。
+
+首版只保留同时满足以下条件的候选：CS2 饰品、上游时间有效且未过期、最低价
+对应平台在售数大于 0、Steam 在售数大于 0、日成交量和价格范围达标、即时比例
+不高于配置阈值。排序依次使用即时比例升序、库存消化天数升序、Steam 日成交量
+降序、平台在售量降序和数据更新时间降序；完全相同时按 SMIS ID 排序。符合条件
+的候选不足 5 项时不会使用缺失、过期或零在售数据补足。
+
+该推荐是即时行情候选，不读取账户、库存或交易记录，也尚未纳入 T+7 预测和四维
+风险评级。购买前仍需核对实际挂单、磨损/印花等具体属性和七天交易冷却。
 
 ## 数据来源
 
@@ -57,7 +79,8 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 | 饰品搜索与身份 | SMIS 提供饰品 ID、AppID、市场哈希名、中文名和稀有度 |
 | 当前市场行情 | SMIS 提供 BUFF、悠悠有品、C5、IGXE、ECO 卖价与挂单数量，以及 Steam 售价、在售数量和日成交量 |
 | 历史行情 | SMIS 提供最多 30 天的 BUFF 与 Steam 价格、库存和成交量序列，用于历史补全与本地分析 |
-| 本地派生数据 | 插件计算 Steam 预计到手价、最低平台价、各种比例、七日预测、风险评级和告警状态 |
+| 挂刀候选 | SMIS 批量候选用于本地可交易性过滤和确定性 Top 5 排序 |
+| 本地派生数据 | 插件计算 Steam 预计到手价、最低平台价、各种比例、七日预测、风险评级、推荐排序和告警状态 |
 
 平台名称表示 SMIS 返回字段所对应的市场，并不代表插件取得了相应平台的官方实时数据。上游采集频率、原始口径、延迟和字段可用性由 SMIS 控制；异常或缺失会影响查询、告警、预测和风险结果。插件不读取 Steam 账户、交易记录、用户库存或其他个人资产数据。
 

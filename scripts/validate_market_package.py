@@ -41,6 +41,7 @@ ARCHIVE_FILES = (
     "core/manager.py",
     "core/market.py",
     "core/presentation.py",
+    "core/recommendation.py",
     "core/repository.py",
     "core/risk.py",
     "core/rules.py",

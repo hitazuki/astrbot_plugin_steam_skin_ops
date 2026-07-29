@@ -256,7 +256,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
     def test_command_contract_and_admin_permissions_are_present(self):
         source = (ROOT / "main.py").read_text(encoding="utf-8")
         for command in (
-            "skin", "search", "quote", "items", "rule", "list", "add",
+            "skin", "search", "quote", "recommend", "items", "rule", "list", "add",
             "set", "remove", "test", "status", "help",
         ):
             self.assertIn(f'("{command}")', source)

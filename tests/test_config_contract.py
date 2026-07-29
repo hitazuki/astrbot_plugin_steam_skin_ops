@@ -3,7 +3,7 @@ import unittest
 from dataclasses import asdict
 from pathlib import Path
 
-from core.config import PluginSettings, load_settings
+from core.config import ConfigError, PluginSettings, load_settings
 
 ROOT = Path(__file__).parents[1]
 
@@ -34,6 +34,19 @@ class ConfigContractTestCase(unittest.TestCase):
                     definition["default"],
                     expected_types[definition["type"]],
                 )
+
+    def test_recommendation_thresholds_reject_unsafe_ranges(self):
+        for config, message in (
+            (
+                {"recommend_min_price": 100, "recommend_max_price": 50},
+                "recommend_max_price",
+            ),
+            ({"recommend_max_ratio_percent": 101}, "recommend_max_ratio_percent"),
+        ):
+            with self.subTest(config=config):
+                with self.assertRaises(ConfigError) as caught:
+                    load_settings(config)
+                self.assertIn(message, str(caught.exception))
 
 
 if __name__ == "__main__":
