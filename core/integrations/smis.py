@@ -323,7 +323,7 @@ class SmisClient:
         payload = {
             "model": 0,
             "platforms": ["buff", "uuyp", "c5", "igxe", "eco"],
-            "appid": "730",
+            "appid": None,
             "minPrice": float(min_price),
             "maxPrice": float(max_price),
             "minTransactionQuantity": int(min_transaction_quantity),

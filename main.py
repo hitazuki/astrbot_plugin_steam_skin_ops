@@ -24,7 +24,7 @@ PLUGIN_NAME = "astrbot_plugin_steam_skin_ops"
 HELP_TEXT = """Steam Skin Ops 命令：
 /skin search <名称> - 搜索 SMIS 饰品 ID
 /skin quote <SMIS_ID|名称> - 全市场即时查询
-/skin recommend [预算上限] - 确定性即时挂刀 Top 5
+/skin recommend [最高价] [最低价] [最低Steam日成交量] - 确定性挂刀 Top 5
 /skin rule add <SMIS_ID|名称> <ratio|t7|platform|steam> <阈值>
 /skin rule list [SMIS_ID] - 当前会话规则
 /skin rule set <RULE_ID> <新阈值>
@@ -176,11 +176,18 @@ class SteamSkinOpsPlugin(Star):
     async def recommend_items(
         self,
         event: AstrMessageEvent,
-        budget: float | None = None,
+        max_price: float | None = None,
+        min_price: float | None = None,
+        min_steam_volume: int | None = None,
     ):
-        """按确定性即时策略推荐最多五个挂刀候选。"""
+        """按 T+7、风险和即时比例综合推荐最多五个挂刀候选。"""
         try:
-            data = await self._call(self._require_manager().recommend, budget)
+            data = await self._call(
+                self._require_manager().recommend,
+                max_price,
+                min_price,
+                min_steam_volume,
+            )
             yield event.plain_result(format_recommendations(data))
         except Exception as exc:
             yield event.plain_result(f"推荐失败：{self._error_text(exc)}")

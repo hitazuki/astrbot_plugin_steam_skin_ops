@@ -52,7 +52,7 @@
   "recommend_min_price": {
     "description": "挂刀推荐最低平台买入价（元）",
     "type": "float",
-    "default": 30.0
+    "default": 1.0
   },
   "recommend_max_price": {
     "description": "挂刀推荐最高平台买入价（元）",

@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 import math
 import threading
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
 
 from .alerting import evaluate_rule_transition
@@ -19,7 +20,13 @@ from .presentation import (
     format_breakthrough_alert,
     format_rule_alert,
 )
-from .recommendation import RecommendationPolicy, rank_recommendations
+from .recommendation import (
+    RecommendationPolicy,
+    dynamic_analysis_limit,
+    final_recommendation_rank_key,
+    rank_recommendations,
+    score_recommendation,
+)
 from .repository import MonitorStorage, RuleItemLimitError
 from .risk import forecast_and_risk
 from .rules import (
@@ -101,6 +108,8 @@ class MonitoringManager:
         self.breakthrough_step = float(breakthrough_step_percent) / 100
         self._locks_guard = threading.Lock()
         self._item_locks: dict[int, threading.Lock] = {}
+        self._recommend_history_rate_lock = threading.Lock()
+        self._recommend_history_requests: deque[float] = deque()
         self._audit_rule_configurations()
         self._audit_rule_states()
         self._sync_t7_rule_basis()
@@ -272,11 +281,185 @@ class MonitoringManager:
             logger.warning("SMIS 搜索失败：%s", exc)
             raise ServiceError(503, "smis_search_failed", "SMIS 搜索暂时不可用") from exc
 
-    def recommend(self, budget: float | None = None) -> dict:
+    @staticmethod
+    def _recommendation_item(snapshot: MarketSnapshot) -> dict:
+        return {
+            "item_key": str(snapshot.item_key),
+            "smis_id": int(snapshot.smis_id),
+            "appid": int(snapshot.appid),
+            "name": str(snapshot.name),
+            "name_zh": str(snapshot.name_zh),
+        }
+
+    @staticmethod
+    def _parse_utc(value: object) -> datetime | None:
+        if value is None:
+            return None
         try:
-            policy = self.recommendation_policy.with_budget(budget)
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _recommendation_cache_state(
+        self,
+        snapshot: MarketSnapshot,
+        *,
+        now: datetime,
+    ) -> dict:
+        record = self.storage.recommendation_cache_record(snapshot.item_key)
+        fetched_at = self._parse_utc(record.get("last_fetched_at")) if record else None
+        failed_at = self._parse_utc(record.get("last_failed_at")) if record else None
+        rows = self.storage.market_history_rows(snapshot.item_key, days=30)
+        age_hours = (
+            max(0.0, (now - fetched_at).total_seconds() / 3600)
+            if fetched_at is not None
+            else math.inf
+        )
+        failure_cooldown = bool(
+            failed_at is not None and now - failed_at < timedelta(minutes=30)
+        )
+        if not rows or fetched_at is None:
+            state = "cooldown" if failure_cooldown else "missing"
+        elif age_hours <= 6:
+            state = "fresh"
+        elif age_hours <= 24:
+            state = "usable"
+        else:
+            state = "cooldown" if failure_cooldown else "expired"
+        return {
+            "state": state,
+            "rows": rows,
+            "age_hours": age_hours,
+            "failure_cooldown": failure_cooldown,
+            "record": record,
+        }
+
+    def _claim_recommendation_history_slot(self) -> bool:
+        current = time.monotonic()
+        with self._recommend_history_rate_lock:
+            while (
+                self._recommend_history_requests
+                and current - self._recommend_history_requests[0] >= 60
+            ):
+                self._recommend_history_requests.popleft()
+            if len(self._recommend_history_requests) >= 8:
+                return False
+            self._recommend_history_requests.append(current)
+            return True
+
+    def _fetch_recommendation_history(
+        self,
+        snapshot: MarketSnapshot,
+        policy: RecommendationPolicy,
+        diagnostics: dict,
+        *,
+        refresh: bool,
+    ) -> bool:
+        if diagnostics["history_fetches"] >= policy.history_fetch_budget:
+            return False
+        with self._lock_for(snapshot.smis_id):
+            current = datetime.now(timezone.utc)
+            cached = self._recommendation_cache_state(snapshot, now=current)
+            if cached["failure_cooldown"]:
+                return cached["state"] in {"fresh", "usable"}
+            if refresh:
+                if cached["state"] != "usable":
+                    return cached["state"] == "fresh"
+            elif cached["state"] not in {"missing", "expired"}:
+                return cached["state"] in {"fresh", "usable"}
+            if not self._claim_recommendation_history_slot():
+                diagnostics["rate_limited"] += 1
+                return False
+            diagnostics["history_fetches"] += 1
+            started = time.monotonic()
+            item = self._recommendation_item(snapshot)
+            try:
+                snapshots = self.source.fetch_history(item, 30)
+                if not snapshots:
+                    raise RuntimeError("SMIS 历史数据为空")
+                self.storage.save_snapshots(snapshots)
+                self.storage.mark_recommendation_cache_fetched(
+                    snapshot.item_key,
+                    snapshot.smis_id,
+                    snapshot.appid,
+                    at=current,
+                )
+                if refresh:
+                    diagnostics["history_refreshes"] += 1
+                return True
+            except Exception as exc:
+                diagnostics["history_failures"] += 1
+                self.storage.mark_recommendation_cache_failed(
+                    snapshot.item_key,
+                    snapshot.smis_id,
+                    snapshot.appid,
+                    at=current,
+                )
+                logger.warning(
+                    "推荐历史获取失败 smis_id=%s: %s",
+                    snapshot.smis_id,
+                    exc,
+                )
+                return False
+            finally:
+                diagnostics["history_seconds"] += time.monotonic() - started
+
+    def _score_recommendation_candidate(
+        self,
+        snapshot: MarketSnapshot,
+        row: dict,
+        policy: RecommendationPolicy,
+        *,
+        now: datetime,
+    ) -> dict | None:
+        cached = self._recommendation_cache_state(snapshot, now=now)
+        if cached["state"] not in {"fresh", "usable"}:
+            return None
+        self.storage.mark_recommendation_cache_used(
+            snapshot.item_key,
+            snapshot.smis_id,
+            snapshot.appid,
+            at=now,
+        )
+        stats = seven_day_history_stats(
+            self.storage.steam_history(
+                snapshot.item_key,
+                days=7,
+                max_current_lag_seconds=self.poll_interval_seconds,
+            )
+        )
+        forecast, risk = forecast_and_risk(
+            cached["rows"],
+            snapshot,
+            stats,
+            max_current_lag_seconds=self.poll_interval_seconds,
+        )
+        return score_recommendation(
+            row,
+            forecast,
+            risk,
+            policy,
+            history_age_hours=float(cached["age_hours"]),
+        )
+
+    def recommend(
+        self,
+        max_price: float | None = None,
+        min_price: float | None = None,
+        min_steam_volume: int | None = None,
+    ) -> dict:
+        started = time.monotonic()
+        try:
+            policy = self.recommendation_policy.with_overrides(
+                max_price=max_price,
+                min_price=min_price,
+                min_steam_volume=min_steam_volume,
+            )
         except ValueError as exc:
-            raise ServiceError(422, "invalid_budget", str(exc)) from exc
+            raise ServiceError(422, "invalid_recommendation_filter", str(exc)) from exc
         try:
             snapshots = self.source.fetch_exchange_candidates(
                 min_price=policy.min_price,
@@ -293,7 +476,127 @@ class MonitoringManager:
                 "recommendation_source_unavailable",
                 "SMIS 挂刀候选暂时不可用",
             ) from exc
-        return rank_recommendations(snapshots, policy)
+        instant = rank_recommendations(
+            snapshots,
+            policy,
+            limit=policy.candidate_limit,
+        )
+        pool_limit = dynamic_analysis_limit(instant["recommendations"], policy)
+        rows = instant["recommendations"][:pool_limit]
+        snapshot_by_id = {int(row.smis_id): row for row in snapshots}
+        pool = [
+            (snapshot_by_id[int(row["smis_id"])], row)
+            for row in rows
+            if int(row["smis_id"]) in snapshot_by_id
+        ]
+        now = datetime.now(timezone.utc)
+        initial_states = {
+            int(snapshot.smis_id): self._recommendation_cache_state(snapshot, now=now)
+            for snapshot, _ in pool
+        }
+        diagnostics = {
+            "cache_hits": sum(
+                state["state"] in {"fresh", "usable"}
+                for state in initial_states.values()
+            ),
+            "history_fetches": 0,
+            "history_refreshes": 0,
+            "history_failures": 0,
+            "history_skipped": 0,
+            "rate_limited": 0,
+            "history_seconds": 0.0,
+        }
+
+        for snapshot, _ in pool:
+            state = initial_states[int(snapshot.smis_id)]["state"]
+            if state in {"missing", "expired"}:
+                self._fetch_recommendation_history(
+                    snapshot,
+                    policy,
+                    diagnostics,
+                    refresh=False,
+                )
+
+        scored = [
+            candidate
+            for snapshot, row in pool
+            if (
+                candidate := self._score_recommendation_candidate(
+                    snapshot,
+                    row,
+                    policy,
+                    now=datetime.now(timezone.utc),
+                )
+            )
+            is not None
+        ]
+
+        stale_pool = [
+            snapshot
+            for snapshot, _ in pool
+            if self._recommendation_cache_state(
+                snapshot,
+                now=datetime.now(timezone.utc),
+            )["state"] == "usable"
+        ]
+        refresh_candidates = (
+            stale_pool[:2] if len(scored) >= policy.result_limit else []
+        )
+        for snapshot in refresh_candidates:
+            self._fetch_recommendation_history(
+                snapshot,
+                policy,
+                diagnostics,
+                refresh=True,
+            )
+
+        if diagnostics["history_refreshes"]:
+            scored = [
+                candidate
+                for snapshot, row in pool
+                if (
+                    candidate := self._score_recommendation_candidate(
+                        snapshot,
+                        row,
+                        policy,
+                        now=datetime.now(timezone.utc),
+                    )
+                )
+                is not None
+            ]
+
+        diagnostics["history_skipped"] = sum(
+            self._recommendation_cache_state(
+                snapshot,
+                now=datetime.now(timezone.utc),
+            )["state"]
+            not in {"fresh", "usable"}
+            for snapshot, _ in pool
+        )
+        scored.sort(key=final_recommendation_rank_key)
+        diagnostics["history_seconds"] = round(diagnostics["history_seconds"], 3)
+        diagnostics["total_seconds"] = round(time.monotonic() - started, 3)
+        logger.info(
+            "推荐完成 scanned=%s eligible=%s pool=%s ready=%s cache_hits=%s "
+            "history_fetches=%s refreshes=%s skipped=%s duration=%.3fs",
+            instant["scanned_count"],
+            instant["eligible_count"],
+            len(pool),
+            len(scored),
+            diagnostics["cache_hits"],
+            diagnostics["history_fetches"],
+            diagnostics["history_refreshes"],
+            diagnostics["history_skipped"],
+            diagnostics["total_seconds"],
+        )
+        return {
+            **instant,
+            "recommendations": scored[: policy.result_limit],
+            "analysis_pool_count": len(pool),
+            "analyzed_count": len(scored),
+            "strategy": "t7_risk_instant_score_v2",
+            "diagnostics": diagnostics,
+        }
 
     @staticmethod
     def _validate_rule(rule_type: str, threshold: float) -> None:

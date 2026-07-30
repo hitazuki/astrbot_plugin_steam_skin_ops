@@ -19,7 +19,7 @@ class PluginSettings:
     smis_timeout_seconds: float = 15.0
     smis_max_retries: int = 3
     smis_min_request_interval_seconds: float = 1.0
-    recommend_min_price: float = 30.0
+    recommend_min_price: float = 1.0
     recommend_max_price: float = 5000.0
     recommend_max_ratio_percent: float = 80.0
     recommend_min_steam_volume: int = 50
@@ -95,7 +95,7 @@ def load_settings(config: Mapping[str, Any]) -> PluginSettings:
             errors,
         ),
         recommend_min_price=_positive(
-            config.get("recommend_min_price", 30),
+            config.get("recommend_min_price", 1),
             "recommend_min_price",
             float,
             errors,

@@ -139,6 +139,7 @@ class SmisClientTestCase(unittest.TestCase):
         request_args, request_kwargs = session.requests[0]
         self.assertEqual(request_args[:2], ("POST", "https://smis.club/api/commodity/exchange"))
         self.assertEqual(request_kwargs["json"]["model"], 0)
+        self.assertIsNone(request_kwargs["json"]["appid"])
         self.assertEqual(request_kwargs["json"]["maxRate"], 0.8)
         self.assertEqual(request_kwargs["json"]["buffTax"], 0.015)
         self.assertEqual(rows[0].smis_id, 100)

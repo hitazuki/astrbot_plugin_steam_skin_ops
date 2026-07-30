@@ -75,6 +75,11 @@ class PluginRuntime:
                 today = now.astimezone(self.local_timezone).date()
                 if self._last_backup_date != today:
                     await asyncio.to_thread(self.storage.prune_snapshots, 30)
+                    await asyncio.to_thread(
+                        self.storage.prune_recommendation_cache,
+                        unused_days=14,
+                        max_entries=200,
+                    )
                     await asyncio.to_thread(self._backup)
                     self._last_backup_date = today
             except asyncio.CancelledError:

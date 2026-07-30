@@ -141,6 +141,7 @@ class RepositorySchemaTests(unittest.TestCase):
                 }
 
             self.assertEqual(storage.get_metadata("schema_version"), str(SCHEMA_VERSION))
+            self.assertIn("recommendation_history_cache", tables)
             self.assertNotIn("monitor_state", tables)
             self.assertNotIn("notification_events", tables)
             self.assertFalse(hasattr(repository, "DEFAULT_STATE"))
@@ -151,6 +152,38 @@ class RepositorySchemaTests(unittest.TestCase):
                 "was_notification_sent",
             ):
                 self.assertFalse(hasattr(MonitorStorage, method))
+
+    def test_v7_migration_adds_recommendation_cache_without_touching_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "v7.db"
+            storage = MonitorStorage(path)
+            storage.upsert_item({
+                "smis_id": 1579,
+                "item_key": "smis:1579",
+                "appid": 730,
+                "name": "Test Item",
+                "name_zh": "测试饰品",
+            })
+            rule = storage.add_rule(1579, "recipient:a", "ratio", 72)
+            with storage.connect() as conn:
+                conn.execute("DROP TABLE recommendation_history_cache")
+                conn.execute(
+                    "UPDATE metadata SET value='7' WHERE key='schema_version'"
+                )
+
+            migrated = MonitorStorage(path)
+
+            self.assertEqual(
+                migrated.get_metadata("schema_version"),
+                str(SCHEMA_VERSION),
+            )
+            self.assertEqual(migrated.list_rules()[0]["id"], rule["id"])
+            with migrated.connect() as conn:
+                table = conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='recommendation_history_cache'"
+                ).fetchone()
+            self.assertIsNotNone(table)
 
     def test_v3_extreme_finite_state_migrates_without_integer_overflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

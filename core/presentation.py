@@ -154,8 +154,9 @@ def format_quote(data: dict) -> str:
 def format_recommendations(data: dict) -> str:
     policy = data.get("policy") or {}
     rows = data.get("recommendations") or []
+    diagnostics = data.get("diagnostics") or {}
     lines = [
-        "挂刀候选 Top 5（确定性即时策略）",
+        "挂刀候选 Top 5（确定性综合评分）",
         "筛选：平台买入价 "
         f"¥{float(policy.get('min_price') or 0):.2f}～"
         f"¥{float(policy.get('max_price') or 0):.2f}｜"
@@ -163,12 +164,20 @@ def format_recommendations(data: dict) -> str:
         f"Steam 日成交 ≥ {int(policy.get('min_steam_volume') or 0)}｜"
         f"数据年龄 ≤ {int(policy.get('max_source_age_minutes') or 0)} 分钟",
         f"候选：扫描 {int(data.get('scanned_count') or 0)}，"
-        f"符合 {int(data.get('eligible_count') or 0)}",
+        f"符合 {int(data.get('eligible_count') or 0)}，"
+        f"历史分析 {int(data.get('analysis_pool_count') or 0)}，"
+        f"完整评分 {int(data.get('analyzed_count') or 0)}",
+        "历史："
+        f"缓存命中 {int(diagnostics.get('cache_hits') or 0)}，"
+        f"上游请求 {int(diagnostics.get('history_fetches') or 0)}"
+        f"（刷新 {int(diagnostics.get('history_refreshes') or 0)}），"
+        f"跳过 {int(diagnostics.get('history_skipped') or 0)}｜"
+        f"耗时 {float(diagnostics.get('total_seconds') or 0):.2f} 秒",
     ]
     if not rows:
         lines.extend([
-            "当前没有同时满足价格、比例、流动性和时效要求的候选。",
-            "本结果不会用缺失、过期或零在售数据补足 Top 5。",
+            "当前没有同时满足筛选条件且具备有效 T+7 与风险评估的候选。",
+            "本结果不会用缺失、过期、零成交或零在售数据补足 Top 5。",
         ])
         return "\n".join(lines)
 
@@ -182,12 +191,21 @@ def format_recommendations(data: dict) -> str:
             )
         except (TypeError, ValueError):
             pass
+        forecast = row.get("forecast") or {}
+        risk = row.get("risk_assessment") or {}
+        forecast_ratio = forecast.get("forecast_balance_ratio")
+        risk_ratio = risk.get("risk_balance_ratio")
         lines.extend([
-            f"{index}. {row['name_zh']}  [SMIS {row['smis_id']}]",
+            f"{index}. {row['name_zh']}  [{row.get('game') or row['appid']}｜"
+            f"SMIS {row['smis_id']}｜{float(row['score']):.2f} 分]",
             f"   {row['platform']} ¥{float(row['platform_price']):.2f}"
             f"（在售 {int(row['platform_sell_num'])}） → "
             f"Steam 到手 ¥{float(row['steam_net']):.2f}｜"
-            f"比例 {float(row['ratio']):.2%}",
+            f"即时 {float(row['ratio']):.2%}",
+            f"   T+7 {float(forecast_ratio):.2%}｜"
+            f"风险比例 {float(risk_ratio):.2%}｜"
+            f"总体{level_text(risk.get('overall_level'))}风险｜"
+            f"历史缓存 {float(row['history_age_hours']):.1f} 小时",
             f"   Steam 在售/日成交 {int(row['steam_sell_num'])}/"
             f"{int(row['steam_transaction_quantity'])}｜"
             f"库存消化 {float(row['stock_to_flow_days']):.2f} 天｜"
@@ -195,7 +213,8 @@ def format_recommendations(data: dict) -> str:
             f"   {row['links']['smis']}",
         ])
     lines.append(
-        "提示：首版按即时比例和流动性排序，尚未纳入 T+7 预测；"
+        "评分：T+7 40% + 风险比例 35% + 即时比例 25%，并扣除风险、"
+        "低置信度和旧缓存分；"
         "购买前请核对实时挂单、具体饰品属性与交易冷却。"
     )
     return "\n".join(lines)

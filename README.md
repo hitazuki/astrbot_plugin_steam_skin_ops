@@ -17,7 +17,8 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 ```text
 /skin search <名称>                         搜索 SMIS 饰品 ID
 /skin quote <SMIS_ID|名称>                 查询全市场报价和风险
-/skin recommend [预算上限]                 确定性即时挂刀 Top 5
+/skin recommend [最高价] [最低价] [最低Steam日成交量]
+                                            确定性综合挂刀 Top 5
 /skin items                                查看已监控饰品
 /skin rule list [SMIS_ID]                  查看当前会话规则
 /skin rule add <目标> <ratio|t7|platform|steam> <阈值>
@@ -46,29 +47,33 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 | `smis_timeout_seconds` | `15` | 上游请求超时 |
 | `smis_max_retries` | `3` | 临时错误最大尝试次数 |
 | `smis_min_request_interval_seconds` | `1` | 全局请求最小间隔 |
-| `recommend_min_price` | `30` | 推荐候选最低平台买入价 |
+| `recommend_min_price` | `1` | 推荐候选最低平台买入价，也是命令价格下限的配置边界 |
 | `recommend_max_price` | `5000` | 推荐候选最高平台买入价，也是命令预算的配置上限 |
 | `recommend_max_ratio_percent` | `80` | 推荐候选最高即时挂刀比例 |
-| `recommend_min_steam_volume` | `50` | 推荐候选最低 Steam 日成交量 |
+| `recommend_min_steam_volume` | `50` | 推荐候选默认最低 Steam 日成交量；命令可临时覆盖至最低 1 |
 | `recommend_max_age_minutes` | `120` | 推荐候选最大行情年龄 |
 
 配置不合法时插件不会启动后台任务，`/skin status` 会列出需要修复的字段。
 
 ## 确定性挂刀推荐
 
-`/skin recommend` 从 SMIS 当前挂刀候选中最多读取 50 项，在本地重新计算 Steam
-预计到手价和即时挂刀比例，然后返回最多 5 项。可以提供一次性的预算上限，
-例如 `/skin recommend 500`；该金额只会收紧配置中的最高买入价，不会突破配置
-上限。
+`/skin recommend` 从 SMIS 当前挂刀候选中最多读取 50 项，不限制 CS，以上游实际
+返回的游戏范围为准。命令参数依次为最高价、最低价和最低 Steam 日成交量，例如
+`/skin recommend 500 1 5`。单参数仍表示最高价；价格只能收紧配置范围，成交量可
+临时覆盖配置默认值但不能低于 1。
 
-首版只保留同时满足以下条件的候选：CS2 饰品、上游时间有效且未过期、最低价
-对应平台在售数大于 0、Steam 在售数大于 0、日成交量和价格范围达标、即时比例
-不高于配置阈值。排序依次使用即时比例升序、库存消化天数升序、Steam 日成交量
-降序、平台在售量降序和数据更新时间降序；完全相同时按 SMIS ID 排序。符合条件
-的候选不足 5 项时不会使用缺失、过期或零在售数据补足。
+候选必须具备有效且未过期的行情、平台与 Steam 实际在售、至少一笔 Steam 日成交，
+并满足本次价格、成交量和即时比例筛选。系统按第 5 名即时比例动态选择 6、8、10
+或 12 项进行历史分析，再使用与 `/skin quote` 相同的 T+7 预测和四维风险计算。
+最终分数由 T+7 比例 40%、风险平衡比例 35% 和即时比例 25% 组成，并扣除中高风险、
+低置信度及较旧历史缓存的分数；成交量在用户门槛之外通过风险维度影响排名，不再
+重复设置独立权重。
 
-该推荐是即时行情候选，不读取账户、库存或交易记录，也尚未纳入 T+7 预测和四维
-风险评级。购买前仍需核对实际挂单、磨损/印花等具体属性和七天交易冷却。
+每次推荐最多新增 8 次历史请求，30 天原始历史会写入 SQLite 复用；6 小时内无需
+更新，6～24 小时可低时效使用并限量刷新，超过 24 小时必须更新。推荐缓存 14 天
+未使用或超过 200 项时按最久未使用清理，监控规则正在使用的共享历史不受影响。
+历史、预测或风险不足时不会用不可靠数据补足 Top 5。购买前仍需核对实际挂单、
+磨损/印花等具体属性和七天交易冷却。
 
 ## 数据来源
 

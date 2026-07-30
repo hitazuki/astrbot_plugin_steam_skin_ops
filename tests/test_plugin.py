@@ -262,6 +262,9 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f'("{command}")', source)
         self.assertGreaterEqual(source.count("PermissionType.ADMIN"), 5)
         self.assertIn("event.unified_msg_origin", source)
+        self.assertIn("max_price: float | None = None", source)
+        self.assertIn("min_price: float | None = None", source)
+        self.assertIn("min_steam_volume: int | None = None", source)
         self.assertNotIn("service_base_url", source)
         self.assertNotIn("/api/v1/im/message", source)
 
