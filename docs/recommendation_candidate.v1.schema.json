@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "recommendation_candidate.v1.schema.json",
+  "title": "Steam Skin Ops recommendation candidate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_id",
+    "identity",
+    "provenance",
+    "observed_market",
+    "derived_history",
+    "model_output",
+    "deterministic_ranking",
+    "data_quality",
+    "llm_contract"
+  ],
+  "properties": {
+    "schema_version": {"const": "recommendation_candidate.v1"},
+    "record_id": {"type": "string", "minLength": 1},
+    "identity": {
+      "type": "object",
+      "required": ["item_key", "smis_id", "appid", "name", "name_zh"],
+      "properties": {
+        "item_key": {"type": "string"},
+        "smis_id": {"type": "integer"},
+        "appid": {"type": "integer"},
+        "name": {"type": "string"},
+        "name_zh": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["source", "observed_at_utc", "source_updated_at_utc", "volume_cohort"],
+      "properties": {
+        "source": {"type": "string"},
+        "observed_at_utc": {"type": "string", "format": "date-time"},
+        "source_updated_at_utc": {"type": "string", "format": "date-time"},
+        "volume_cohort": {
+          "enum": ["unknown", "volume_lt_5", "volume_5_99", "volume_100_999", "volume_1000_plus"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "observed_market": {"type": "object"},
+    "derived_history": {
+      "type": "object",
+      "required": ["daily_point_count", "coverage", "trend_regime", "daily_series_21d"],
+      "properties": {
+        "daily_point_count": {"type": "integer", "minimum": 0, "maximum": 21},
+        "coverage": {"type": "number", "minimum": 0, "maximum": 1},
+        "trend_regime": {"enum": ["up", "neutral", "down", "unknown"]},
+        "daily_series_21d": {"$ref": "#/$defs/dailySeries"}
+      },
+      "additionalProperties": false
+    },
+    "model_output": {
+      "type": "object",
+      "required": ["forecast", "risk"],
+      "properties": {
+        "forecast": {"type": "object"},
+        "risk": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "deterministic_ranking": {
+      "type": "object",
+      "required": ["policy_version", "eligible", "score", "components", "deductions", "weights"],
+      "properties": {
+        "policy_version": {"const": "t7_risk_instant_score_v3"},
+        "eligible": {"type": "boolean"},
+        "score": {"type": ["number", "null"]},
+        "components": {"type": ["object", "null"]},
+        "deductions": {"type": "array"},
+        "weights": {
+          "type": "object",
+          "properties": {
+            "t7": {"const": 0.4},
+            "risk_ratio": {"const": 0.35},
+            "instant": {"const": 0.25}
+          },
+          "required": ["t7", "risk_ratio", "instant"],
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "data_quality": {"type": "object"},
+    "llm_contract": {
+      "type": "object",
+      "properties": {
+        "role": {"const": "explain_compare_summarize"},
+        "may_override_deterministic_eligibility": {"const": false},
+        "may_override_deterministic_score": {"const": false},
+        "must_cite_record_fields": {"const": true}
+      },
+      "required": ["role", "may_override_deterministic_eligibility", "may_override_deterministic_score", "must_cite_record_fields"],
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "dailySeries": {
+      "type": "object",
+      "required": ["date", "steam_net_cny", "steam_close_net_cny", "steam_daily_volume", "steam_sell_count", "buff_sell_count"],
+      "properties": {
+        "date": {"type": "array", "maxItems": 21, "items": {"type": "string", "format": "date"}},
+        "steam_net_cny": {"type": "array", "maxItems": 21, "items": {"type": ["number", "null"]}},
+        "steam_close_net_cny": {"type": "array", "maxItems": 21, "items": {"type": ["number", "null"]}},
+        "steam_daily_volume": {"type": "array", "maxItems": 21, "items": {"type": ["number", "null"]}},
+        "steam_sell_count": {"type": "array", "maxItems": 21, "items": {"type": ["number", "null"]}},
+        "buff_sell_count": {"type": "array", "maxItems": 21, "items": {"type": ["number", "null"]}}
+      },
+      "additionalProperties": false
+    }
+  }
+}

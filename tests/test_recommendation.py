@@ -1,8 +1,12 @@
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import jsonschema
+
+from core.evaluation import ForecastEvaluationStorage
 from core.manager import MonitoringManager, ServiceError
 from core.market import MarketSnapshot, steam_net_amount
 from core.presentation import format_recommendations
@@ -244,6 +248,43 @@ class RecommendationManagerTestCase(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["history_fetches"], 1)
         self.assertEqual(second["diagnostics"]["history_fetches"], 0)
         self.assertEqual(second["diagnostics"]["cache_hits"], 1)
+
+    def test_v3_candidate_matches_schema_and_does_not_issue_evaluation(self):
+        with TemporaryDirectory() as tmp:
+            source = FakeRecommendationSource([candidate(1, 0.70)])
+            evaluation = ForecastEvaluationStorage(
+                Path(tmp) / "forecast_evaluation.db"
+            )
+            manager = MonitoringManager(
+                MonitorStorage(Path(tmp) / "monitor.db"),
+                source,
+                evaluation_storage=evaluation,
+            )
+
+            result = manager.recommend()
+            record = result["candidate_records"][0]
+            schema = json.loads(
+                (Path(__file__).parents[1]
+                 / "docs/recommendation_candidate.v1.schema.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            jsonschema.Draft202012Validator(schema).validate(record)
+            series = record["derived_history"]["daily_series_21d"]
+            self.assertEqual(len({len(values) for values in series.values()}), 1)
+            self.assertEqual(result["strategy"], "t7_risk_instant_score_v3")
+            self.assertEqual(
+                record["deterministic_ranking"]["weights"],
+                {"t7": 0.4, "risk_ratio": 0.35, "instant": 0.25},
+            )
+            self.assertFalse(
+                record["llm_contract"]["may_override_deterministic_score"]
+            )
+            with evaluation.connect() as connection:
+                issued = connection.execute(
+                    "SELECT COUNT(*) FROM forecast_issuances"
+                ).fetchone()[0]
+            self.assertEqual(issued, 0)
 
     def test_manager_reports_invalid_budget_and_source_failure(self):
         with TemporaryDirectory() as tmp:

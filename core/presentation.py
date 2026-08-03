@@ -86,6 +86,18 @@ def format_quote(data: dict) -> str:
             f"（{confidence}置信度）",
             f"预测倒余额比例：{forecast_ratio_text}",
         ])
+        if (
+            forecast.get("p20_steam_net") is not None
+            and forecast.get("p80_steam_net") is not None
+        ):
+            lines.extend([
+                f"T+7 区间：P20 ¥{float(forecast['p20_steam_net']):.2f} / "
+                f"P50 ¥{float(forecast['predicted_steam_net']):.2f} / "
+                f"P80 ¥{float(forecast['p80_steam_net']):.2f}",
+                f"趋势：{forecast.get('trend_regime') or 'unknown'}；"
+                f"上涨概率 {float(forecast.get('probability_up') or 0):.1%}；"
+                f"区间来源 {forecast.get('interval_source') or 'unknown'}",
+            ])
     else:
         reason = (forecast.get("reasons") or ["历史或当前行情不足"])[0]
         lines.append(f"七日预测：不可用（{reason}）")
@@ -203,9 +215,15 @@ def format_recommendations(data: dict) -> str:
             f"Steam 到手 ¥{float(row['steam_net']):.2f}｜"
             f"即时 {float(row['ratio']):.2%}",
             f"   T+7 {float(forecast_ratio):.2%}｜"
-            f"风险比例 {float(risk_ratio):.2%}｜"
+            f"P20 压力 {float(risk_ratio):.2%}｜"
             f"总体{level_text(risk.get('overall_level'))}风险｜"
             f"历史缓存 {float(row['history_age_hours']):.1f} 小时",
+            f"   区间 ¥{float(forecast['p20_steam_net']):.2f} / "
+            f"¥{float(forecast['predicted_steam_net']):.2f} / "
+            f"¥{float(forecast['p80_steam_net']):.2f}｜"
+            f"趋势 {forecast.get('trend_regime') or 'unknown'}｜"
+            f"{row.get('volume_cohort') or 'unknown'}｜"
+            f"{'正常' if forecast.get('confidence') == 'normal' else '低'}置信度",
             f"   Steam 在售/日成交 {int(row['steam_sell_num'])}/"
             f"{int(row['steam_transaction_quantity'])}｜"
             f"库存消化 {float(row['stock_to_flow_days']):.2f} 天｜"
@@ -213,7 +231,7 @@ def format_recommendations(data: dict) -> str:
             f"   {row['links']['smis']}",
         ])
     lines.append(
-        "评分：T+7 40% + 风险比例 35% + 即时比例 25%，并扣除风险、"
+        "评分（v3）：T+7 P50 比例 40% + P20 压力比例 35% + 即时比例 25%，并扣除风险、"
         "低置信度和旧缓存分；"
         "购买前请核对实时挂单、具体饰品属性与交易冷却。"
     )
@@ -240,6 +258,16 @@ def analysis_reference_lines(
             f"预测模式：{window_text}{forecast['mode_label']}（"
             f"{'正常' if forecast.get('confidence') == 'normal' else '低'}置信度）",
         ])
+        if (
+            forecast.get("p20_steam_net") is not None
+            and forecast.get("p80_steam_net") is not None
+        ):
+            lines.append(
+                f"预测区间：P20 ¥{float(forecast['p20_steam_net']):.2f} / "
+                f"P50 ¥{float(forecast['predicted_steam_net']):.2f} / "
+                f"P80 ¥{float(forecast['p80_steam_net']):.2f}；"
+                f"趋势 {forecast.get('trend_regime') or 'unknown'}"
+            )
     else:
         reasons = forecast.get("reasons") or ["历史或当前行情不足"]
         lines.append(f"七日预测：不可用（{reasons[0]}）")

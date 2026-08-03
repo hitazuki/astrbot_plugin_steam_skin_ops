@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from core.evaluation import ForecastEvaluationStorage
 from core.manager import MonitoringManager
 from core.market import MarketSnapshot, steam_net_amount
 from core.presentation import analysis_reference_lines
@@ -243,7 +244,7 @@ class ServiceTestCase(unittest.TestCase):
 
         self.assertEqual(
             self.storage.get_metadata("alerting:t7_basis"),
-            "seven_day_dynamic_forecast:v1",
+            "seven_day_probabilistic:v2",
         )
         self.assertEqual(
             self.storage.get_rule_state(t7_rule["id"])["alert_active"], 0
@@ -490,6 +491,29 @@ class ServiceTestCase(unittest.TestCase):
         self.assertIn("风险", messages[0][2])
         self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
         self.assertEqual(len(self.stored_messages("daily_summary")), 1)
+
+    def test_daily_forecast_is_shared_across_recipients_and_rules(self):
+        evaluation = ForecastEvaluationStorage(
+            Path(self.tmp.name) / "forecast_evaluation.db"
+        )
+        manager = MonitoringManager(
+            self.storage,
+            ForecastHistorySource([0.70]),
+            evaluation_storage=evaluation,
+        )
+        self.storage.add_rule(1579, "umo:a", "ratio", 1)
+        self.storage.add_rule(1579, "umo:b", "platform", 1)
+        manager.run_cycle(max_workers=1)
+
+        manager.enqueue_daily_summary(date(2026, 7, 25))
+        with evaluation.connect() as connection:
+            rows = connection.execute(
+                "SELECT feature_json FROM forecast_issuances"
+            ).fetchall()
+
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("umo:a", rows[0][0])
+        self.assertNotIn("umo:b", rows[0][0])
 
     def test_empty_daily_check_prevents_later_same_day_summary(self):
         manager = self.manager([0.70])

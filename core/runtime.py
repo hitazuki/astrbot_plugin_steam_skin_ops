@@ -80,6 +80,13 @@ class PluginRuntime:
                         unused_days=14,
                         max_entries=200,
                     )
+                    if self.manager.evaluation_storage is not None:
+                        await asyncio.to_thread(
+                            self.manager.evaluation_storage.prune, 180
+                        )
+                        await asyncio.to_thread(
+                            self.manager.evaluation_storage.mark_missed, now
+                        )
                     await asyncio.to_thread(self._backup)
                     self._last_backup_date = today
             except asyncio.CancelledError:
@@ -129,8 +136,19 @@ class PluginRuntime:
     def _backup(self, retain: int = 7) -> Path:
         destination = self.backup_dir / f"monitor-{datetime.now().strftime('%Y%m%d')}.db"
         self.storage.backup(destination)
+        if self.manager.evaluation_storage is not None:
+            evaluation_destination = (
+                self.backup_dir
+                / f"forecast-evaluation-{datetime.now().strftime('%Y%m%d')}.db"
+            )
+            self.manager.evaluation_storage.backup(evaluation_destination)
         backups = sorted(self.backup_dir.glob("monitor-*.db"), reverse=True)
         for old in backups[retain:]:
+            old.unlink(missing_ok=True)
+        evaluation_backups = sorted(
+            self.backup_dir.glob("forecast-evaluation-*.db"), reverse=True
+        )
+        for old in evaluation_backups[retain:]:
             old.unlink(missing_ok=True)
         return destination
 

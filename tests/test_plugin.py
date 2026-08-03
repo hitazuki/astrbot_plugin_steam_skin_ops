@@ -167,6 +167,9 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(plugin.manager)
             self.assertFalse(plugin.runtime.status()["running"])
             self.assertTrue((Path(tmp) / module.PLUGIN_NAME / "monitor.db").exists())
+            self.assertTrue(
+                (Path(tmp) / module.PLUGIN_NAME / "forecast_evaluation.db").exists()
+            )
             await plugin.terminate()
 
     async def test_invalid_config_is_reported_by_status(self):

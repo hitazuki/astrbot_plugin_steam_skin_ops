@@ -65,7 +65,7 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 候选必须具备有效且未过期的行情、平台与 Steam 实际在售、至少一笔 Steam 日成交，
 并满足本次价格、成交量和即时比例筛选。系统按第 5 名即时比例动态选择 6、8、10
 或 12 项进行历史分析，再使用与 `/skin quote` 相同的 T+7 预测和四维风险计算。
-最终分数由 T+7 比例 40%、风险平衡比例 35% 和即时比例 25% 组成，并扣除中高风险、
+最终分数由 T+7 P50 比例 40%、P20 压力比例 35% 和即时比例 25% 组成，并扣除中高风险、
 低置信度及较旧历史缓存的分数；成交量在用户门槛之外通过风险维度影响排名，不再
 重复设置独立权重。
 
@@ -74,6 +74,11 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 未使用或超过 200 项时按最久未使用清理，监控规则正在使用的共享历史不受影响。
 历史、预测或风险不足时不会用不可靠数据补足 Top 5。购买前仍需核对实际挂单、
 磨损/印花等具体属性和七天交易冷却。
+
+推荐策略标识为 `t7_risk_instant_score_v3`。每个结果同时生成符合
+[`recommendation_candidate.v1`](docs/recommendation_candidate.v1.schema.json)
+的结构化记录，保存市场观测、21 日日序列、P20/P50/P80、风险、确定性分项与扣分。
+结构为未来大模型解释预留，但模型只能解释和比较确定性 Top N，不能改变准入或分数。
 
 ## 数据来源
 
@@ -93,7 +98,11 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 
 ## 数据与存储
 
-数据库和备份位于 AstrBot 的 `data/plugin_data/astrbot_plugin_steam_skin_ops/`。更新插件不会覆盖该目录；卸载插件前如需保留规则，请先备份该目录。插件不读取或迁移旧版独立服务的 `monitor.db`。
+数据库和备份位于 AstrBot 的 `data/plugin_data/astrbot_plugin_steam_skin_ops/`。
+规则、行情和通知继续使用 schema v8 的 `monitor.db`；监控饰品的 T+7 真实到期评估
+使用独立 schema v1 的 `forecast_evaluation.db`。两个数据库均每日在线备份。更新插件
+不会覆盖该目录；卸载插件前如需保留规则，请先备份该目录。插件不读取或迁移旧版
+独立服务的 `monitor.db`。
 
 默认最多监控 20 个饰品、每 30 分钟轮询一次。纯插件版省去独立 Python/Uvicorn 容器，但行情计算与 SQLite 负载会计入 AstrBot 进程。
 
@@ -104,7 +113,11 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 - `platform`：最低第三方平台价达到买入目标。
 - `steam`：Steam 展示售价达到库存清理目标。
 
-七日预测会根据数据覆盖、回测误差和趋势诊断动态选择持平、近期水平、稳健线性或稳健对数模型，并用于 `t7` 规则；价格、波动、库存、成交量风险评估仅供参考，不参与四类规则的基础阈值判断。第三方行情可能延迟、缺失或发生口径变化；本插件不构成投资建议，使用者应独立判断交易风险。
+七日预测保留 SMIS 原生时间戳并按 UTC 日聚合，以 exact-H7 回测选择持平、近期水平、
+稳健线性或稳健对数模型，输出 P20/P50/P80、上涨概率、趋势状态和区间来源。
+`t7` 使用 P50；风险底价使用 P20，并按当前成交量 `<100`、`100–999`、`≥1000`
+分层判断波动，以多信号规则聚合总体风险。数据不足进入质量状态，不会产生虚假低风险
+或交易告警。风险评估仅供参考，不参与四类规则的基础阈值判断。
 
 预测的数据预处理、候选模型、回测选择、置信度以及价格、波动、库存、成交量四维风险阈值，详见[《数据来源、七日预测与风险计算规则》](docs/DATA_SOURCES_AND_METHODS.md)。
 

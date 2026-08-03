@@ -10,6 +10,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .core.config import ConfigError, PluginSettings, load_settings
+from .core.evaluation import ForecastEvaluationStorage
 from .core.integrations.smis import SmisClient
 from .core.manager import MonitoringManager, ServiceError
 from .core.presentation import format_quote, format_recommendations
@@ -58,6 +59,9 @@ class SteamSkinOpsPlugin(Star):
             min_request_interval=self.settings.smis_min_request_interval_seconds,
         )
         self.storage = MonitorStorage(data_dir / "monitor.db")
+        self.evaluation_storage = ForecastEvaluationStorage(
+            data_dir / "forecast_evaluation.db"
+        )
         self.manager = MonitoringManager(
             self.storage,
             self.source,
@@ -72,6 +76,7 @@ class SteamSkinOpsPlugin(Star):
                 min_steam_volume=self.settings.recommend_min_steam_volume,
                 max_source_age_minutes=self.settings.recommend_max_age_minutes,
             ),
+            evaluation_storage=self.evaluation_storage,
         )
         self._dispatch_lock = asyncio.Lock()
         self.runtime = PluginRuntime(

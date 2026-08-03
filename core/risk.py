@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from statistics import median, stdev, variance
+from statistics import NormalDist, median, stdev, variance
 from typing import Any
 
 from .market import (
@@ -13,21 +13,42 @@ from .market import (
 )
 
 FORECAST_DAYS = 7
+FORECAST_MODEL_VERSION = "seven_day_probabilistic:v2"
 FORECAST_WINDOW_DAYS = 21
 MIN_FORECAST_DAYS = 14
 ANALYSIS_DAYS = 30
 GRID_HOURS = 2
-MIN_COVERAGE = 0.8
-MIN_VALIDATION_PAIRS = 12
+MIN_COVERAGE = 0.7
+NORMAL_COVERAGE = 0.8
+MIN_VALIDATION_PAIRS = 4
 MIN_MODEL_IMPROVEMENT = 0.05
+MIN_ITEM_INTERVAL_RESIDUALS = 5
+MIN_POOLED_INTERVAL_RESIDUALS = 30
+INTERVAL_Z80 = 0.8416212335729143
 
 LEVEL_ORDER = {"unknown": -1, "low": 0, "medium": 1, "high": 2}
 MODE_LABELS = {
-    "persistence": "当前价持平",
+    "persistence": "当前现价持平",
     "recent_level": "近期水平",
     "theil_sen_linear": "稳健线性趋势",
     "theil_sen_log": "稳健对数趋势",
 }
+
+
+def volume_cohort(value: Any) -> str:
+    try:
+        volume = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if not math.isfinite(volume) or volume < 0:
+        return "unknown"
+    if volume < 5:
+        return "volume_lt_5"
+    if volume < 100:
+        return "volume_5_99"
+    if volume < 1000:
+        return "volume_100_999"
+    return "volume_1000_plus"
 
 
 def snapshot_fingerprint(snapshot: MarketSnapshot | dict[str, Any]) -> tuple[Any, ...]:
@@ -67,7 +88,11 @@ def canonical_two_hour_rows(
     *,
     max_current_lag_seconds: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Merge history and successful observations on a fixed two-hour grid."""
+    """Merge native upstream history and successful observations by timestamp.
+
+    The compatibility name is retained because storage and tests import it, but
+    forecast coverage no longer assumes a fixed local two-hour sampling grid.
+    """
     current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     cutoff = current_time - timedelta(days=ANALYSIS_DAYS)
     buckets: dict[datetime, tuple[int, datetime, dict[str, Any]]] = {}
@@ -90,7 +115,7 @@ def canonical_two_hour_rows(
             continue
         if event_time < cutoff or event_time > current_time + timedelta(minutes=5):
             continue
-        bucket = _grid_time(event_time)
+        bucket = event_time.astimezone(timezone.utc).replace(microsecond=0)
         priority = 1 if kind == "current" else 0
         candidate = (priority, event_time, row)
         previous = buckets.get(bucket)
@@ -120,51 +145,40 @@ def has_usable_history_coverage(
             continue
         if math.isfinite(price) and price > 0:
             usable_rows.append(row)
-    grid = canonical_two_hour_rows(
+    native = canonical_two_hour_rows(
         usable_rows,
         now=current_time,
         max_current_lag_seconds=max_current_lag_seconds,
     )
-    if not grid:
+    if not native:
         return False
-    timestamps = [_parse_time(row["_grid_at"]) for row in grid]
+    timestamps = [_parse_time(row["_grid_at"]) for row in native]
     window_start = current_time - timedelta(days=max(1, int(required_days)))
-    bucket_seconds = GRID_HOURS * 3600
-    if min(timestamps) > window_start + timedelta(seconds=bucket_seconds):
+    if min(timestamps) > window_start + timedelta(days=1):
         return False
-    recent_tolerance = max(bucket_seconds * 2, int(max_current_lag_seconds) * 2)
+    recent_tolerance = max(86400, int(max_current_lag_seconds) * 2)
     if max(timestamps) < current_time - timedelta(seconds=recent_tolerance):
         return False
-    relevant = [timestamp for timestamp in timestamps if timestamp >= window_start]
-    expected = max(
-        1,
-        math.ceil(max(1, int(required_days)) * 86400 / bucket_seconds),
-    )
-    return len(relevant) / expected >= float(min_coverage)
+    daily = _daily_price_points(native)
+    relevant_days = [day for day, _ in daily if day >= window_start]
+    expected = max(1, int(required_days))
+    return len(relevant_days) / expected >= float(min_coverage)
 
 
 def _daily_price_points(rows: list[dict[str, Any]]) -> list[tuple[datetime, float]]:
-    by_day: dict[datetime, list[tuple[datetime, float]]] = defaultdict(list)
+    by_day: dict[datetime, list[float]] = defaultdict(list)
     for row in rows:
         net = steam_net_amount(float(row.get("steam_sell_price") or 0))
         if net <= 0:
             continue
         grid_at = _parse_time(row["_grid_at"])
         day = grid_at.replace(hour=0, minute=0, second=0, microsecond=0)
-        by_day[day].append((grid_at, net))
-
-    all_values = sorted(point for points in by_day.values() for point in points)
-    result: list[tuple[datetime, float]] = []
-    for day, points in sorted(by_day.items()):
-        anchor = max(timestamp for timestamp, _ in points)
-        window_start = anchor - timedelta(hours=24)
-        values = [
-            value for timestamp, value in all_values
-            if window_start < timestamp <= anchor
-        ]
-        if values:
-            result.append((day, median(values)))
-    return result
+        by_day[day].append(net)
+    return [
+        (day, median(values))
+        for day, values in sorted(by_day.items())
+        if values
+    ]
 
 
 def _daily_field_points(
@@ -231,14 +245,25 @@ def _kendall_tau(points: list[tuple[datetime, float]]) -> float:
     return concordance / pairs if pairs else 0.0
 
 
+def _realized_sigma7(points: list[tuple[datetime, float]]) -> float | None:
+    returns = [
+        math.log(second / first)
+        for (_, first), (_, second) in zip(points, points[1:])
+        if first > 0 and second > 0
+    ][-7:]
+    if len(returns) < 2:
+        return None
+    return stdev(returns) * math.sqrt(FORECAST_DAYS)
+
+
 def _candidate_prediction(
     points: list[tuple[datetime, float]], mode: str, window: int,
-    target: datetime,
+    target: datetime, *, current_value: float | None = None,
 ) -> float | None:
     if not points:
         return None
     if mode == "persistence":
-        return points[-1][1]
+        return current_value if current_value is not None else points[-1][1]
     if mode == "recent_level":
         return median(value for _, value in points[-3:])
     if len(points) < window:
@@ -252,31 +277,37 @@ def _candidate_prediction(
 def _validation_score(
     points: list[tuple[datetime, float]], mode: str, window: int,
     common_required: int,
-) -> tuple[float | None, int, float | None]:
+) -> tuple[float | None, int, float | None, list[float]]:
     required = window if mode.startswith("theil_sen") else MIN_FORECAST_DAYS
-    weighted_error = 0.0
-    total_weight = 0
+    errors: list[float] = []
+    log_residuals: list[float] = []
     pairs = 0
-    persistence_error = 0.0
-    for origin_index in range(max(required, common_required) - 1, len(points) - 1):
+    persistence_errors: list[float] = []
+    for origin_index in range(max(required, common_required) - 1, len(points)):
         train = points[:origin_index + 1]
-        for horizon in range(1, min(FORECAST_DAYS, len(points) - origin_index - 1) + 1):
-            actual_time, actual = points[origin_index + horizon]
-            predicted = _candidate_prediction(train, mode, window, actual_time)
-            baseline = train[-1][1]
-            if predicted is None or actual <= 0:
-                continue
-            weight = horizon
-            weighted_error += weight * abs(predicted / actual - 1)
-            persistence_error += weight * abs(baseline / actual - 1)
-            total_weight += weight
-            pairs += 1
-    if not total_weight:
-        return None, 0, None
+        target_time = train[-1][0] + timedelta(days=FORECAST_DAYS)
+        target = next(
+            ((timestamp, value) for timestamp, value in points if timestamp == target_time),
+            None,
+        )
+        if target is None:
+            continue
+        actual_time, actual = target
+        predicted = _candidate_prediction(train, mode, window, actual_time)
+        baseline = train[-1][1]
+        if predicted is None or predicted <= 0 or actual <= 0:
+            continue
+        errors.append(abs(predicted / actual - 1))
+        persistence_errors.append(abs(baseline / actual - 1))
+        log_residuals.append(math.log(actual / predicted))
+        pairs += 1
+    if not errors:
+        return None, 0, None, []
     return (
-        weighted_error / total_weight,
+        sum(errors) / len(errors),
         pairs,
-        persistence_error / total_weight,
+        sum(persistence_errors) / len(persistence_errors),
+        log_residuals,
     )
 
 
@@ -341,10 +372,8 @@ def _coverage(
         return 0.0, 0
     first_day, last_day = used[0][0], used[-1][0]
     span_days = max(1, int((last_day - first_day).total_seconds() / 86400) + 1)
-    start = last_day - timedelta(days=span_days - 1)
-    relevant = [row for row in grid if _parse_time(row["_grid_at"]) >= start]
-    expected = max(1, span_days * (24 // GRID_HOURS))
-    return min(1.0, len(relevant) / expected), span_days
+    expected = max(1, span_days)
+    return min(1.0, len(used) / expected), span_days
 
 
 def _forecast_candidates(
@@ -366,11 +395,17 @@ def _evaluate_forecast_candidate(
     common_validation_window: int, current_steam_net: float,
 ) -> dict[str, Any] | None:
     target = daily[-1][0] + timedelta(days=FORECAST_DAYS)
-    predicted = _candidate_prediction(daily, mode, window, target)
+    predicted = _candidate_prediction(
+        daily,
+        mode,
+        window,
+        target,
+        current_value=current_steam_net if mode == "persistence" else None,
+    )
     if predicted is None:
         return None
 
-    error, pairs, baseline_error = _validation_score(
+    error, pairs, baseline_error, log_residuals = _validation_score(
         daily, mode, window, common_validation_window
     )
     valid = True
@@ -380,6 +415,13 @@ def _evaluate_forecast_candidate(
         valid, diagnostics, rejection_reasons = _trend_diagnostics(
             daily, mode, window, current_steam_net
         )
+        sigma7 = _realized_sigma7(daily)
+        change_limit = min(0.50, max(0.10, 2 * float(sigma7 or 0.0)))
+        forecast_change = predicted / current_steam_net - 1
+        diagnostics["forecast_change_limit"] = change_limit
+        if abs(forecast_change) > change_limit:
+            valid = False
+            rejection_reasons.append("趋势外推超过近期波动边界")
 
     improvement = None
     if error is not None and baseline_error and baseline_error > 0:
@@ -392,6 +434,7 @@ def _evaluate_forecast_candidate(
     return {
         "mode": mode, "window": window, "predicted": predicted,
         "error": error, "pairs": pairs, "improvement": improvement,
+        "log_residuals": log_residuals,
         "valid": valid, "diagnostics": diagnostics,
         "rejection_reasons": rejection_reasons,
     }
@@ -400,10 +443,7 @@ def _evaluate_forecast_candidate(
 def _evaluate_forecast_candidates(
     daily: list[tuple[datetime, float]], current_steam_net: float,
 ) -> list[dict[str, Any]]:
-    common_validation_window = (
-        FORECAST_WINDOW_DAYS
-        if len(daily) >= FORECAST_WINDOW_DAYS else MIN_FORECAST_DAYS
-    )
+    common_validation_window = MIN_FORECAST_DAYS
     evaluated = []
     for mode, window in _forecast_candidates(daily):
         candidate = _evaluate_forecast_candidate(
@@ -426,16 +466,6 @@ def _select_forecast_candidate(
     non_baseline = [row for row in validated if row["mode"] != "persistence"]
     if non_baseline:
         return min(non_baseline, key=lambda row: row["error"])
-
-    diagnostic_trends = [
-        row for row in eligible
-        if row["mode"].startswith("theil_sen")
-    ]
-    if diagnostic_trends and not validated:
-        return min(
-            diagnostic_trends,
-            key=lambda row: float(row["diagnostics"].get("residual_mad", 1e9)),
-        )
 
     recent = next(
         (row for row in eligible if row["mode"] == "recent_level"), None
@@ -462,17 +492,90 @@ def _forecast_reasons(
     return reasons[:3]
 
 
+def _quantile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def _trend_regime(daily: list[tuple[datetime, float]]) -> str:
+    if len(daily) < 7:
+        return "unknown"
+    recent = daily[-7:]
+    if (recent[-1][0] - recent[0][0]).days > 7:
+        return "unknown"
+    change = recent[-1][1] / recent[0][1] - 1
+    tau = _kendall_tau(recent)
+    if change >= 0.02 and tau >= 0.30:
+        return "up"
+    if change <= -0.02 and tau <= -0.30:
+        return "down"
+    return "neutral"
+
+
 def _assemble_forecast_result(
     base: dict[str, Any], selected: dict[str, Any],
     evaluated: list[dict[str, Any]], snapshot: MarketSnapshot,
     lowest: tuple[str, float, int] | None, span_days: int,
+    daily: list[tuple[datetime, float]],
+    pooled_residuals_by_mode: dict[str, list[float]] | None,
 ) -> dict[str, Any]:
-    predicted = float(selected["predicted"])
+    raw_predicted = float(selected["predicted"])
+    item_residuals = [
+        float(value) for value in selected.get("log_residuals", [])
+        if math.isfinite(float(value))
+    ]
+    bias_correction = 0.0
+    if len(item_residuals) >= MIN_ITEM_INTERVAL_RESIDUALS:
+        bias_correction = max(
+            math.log(0.90), min(math.log(1.10), median(item_residuals))
+        )
+    predicted = raw_predicted * math.exp(bias_correction)
+    pooled = [
+        float(value)
+        for value in (pooled_residuals_by_mode or {}).get(selected["mode"], [])
+        if math.isfinite(float(value))
+    ]
+    if len(item_residuals) >= MIN_ITEM_INTERVAL_RESIDUALS:
+        interval_residuals = item_residuals
+        interval_source = "item_exact_t7"
+    elif len(pooled) >= MIN_POOLED_INTERVAL_RESIDUALS:
+        interval_residuals = pooled
+        interval_source = "cohort_exact_t7"
+    else:
+        interval_residuals = []
+        interval_source = "realized_volatility"
+    if interval_residuals:
+        p20 = raw_predicted * math.exp(_quantile(interval_residuals, 0.20))
+        p80 = raw_predicted * math.exp(_quantile(interval_residuals, 0.80))
+        probability_up = sum(
+            raw_predicted * math.exp(value) > snapshot.steam_net
+            for value in interval_residuals
+        ) / len(interval_residuals)
+    else:
+        sigma7 = float(_realized_sigma7(daily) or 0.0)
+        p20 = predicted * math.exp(-INTERVAL_Z80 * sigma7)
+        p80 = predicted * math.exp(INTERVAL_Z80 * sigma7)
+        if sigma7 > 0 and snapshot.steam_net > 0:
+            location = math.log(predicted / snapshot.steam_net)
+            probability_up = NormalDist().cdf(location / sigma7)
+        else:
+            probability_up = 1.0 if predicted > snapshot.steam_net else 0.0
+    p20 = min(p20, predicted)
+    p80 = max(p80, predicted)
     change = predicted / snapshot.steam_net - 1
     ratio = float(lowest[1]) / predicted if lowest and predicted > 0 else None
+    risk_ratio = float(lowest[1]) / p20 if lowest and p20 > 0 else None
     normal_confidence = (
         span_days >= FORECAST_WINDOW_DAYS
         and selected["pairs"] >= MIN_VALIDATION_PAIRS
+        and float(base.get("coverage") or 0) >= NORMAL_COVERAGE
+        and interval_source != "realized_volatility"
     )
     return {
         **base,
@@ -482,8 +585,16 @@ def _assemble_forecast_result(
         "window_days": selected["window"],
         "confidence": "normal" if normal_confidence else "low",
         "predicted_steam_net": round(predicted, 4),
+        "p20_steam_net": round(p20, 4),
+        "p80_steam_net": round(p80, 4),
         "change_pct": round(change * 100, 2),
         "forecast_balance_ratio": round(ratio, 4) if ratio is not None else None,
+        "risk_balance_ratio": round(risk_ratio, 4) if risk_ratio is not None else None,
+        "trend_regime": _trend_regime(daily),
+        "probability_up": round(max(0.0, min(1.0, probability_up)), 4),
+        "interval_source": interval_source,
+        "exact_t7_validation_count": selected["pairs"],
+        "bias_correction_pct": round((math.exp(bias_correction) - 1) * 100, 2),
         "validation_error_pct": (
             round(float(selected["error"]) * 100, 2)
             if selected["error"] is not None else None
@@ -498,6 +609,7 @@ def forecast_seven_days(
     rows: list[dict[str, Any]], snapshot: MarketSnapshot, *,
     stale: bool = False, now: datetime | None = None,
     max_current_lag_seconds: int | None = None,
+    pooled_residuals_by_mode: dict[str, list[float]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[tuple[datetime, float]]]:
     base = {
         "status": "unavailable",
@@ -510,9 +622,17 @@ def forecast_seven_days(
         "confidence": "none",
         "current_steam_net": round(snapshot.steam_net, 4),
         "predicted_steam_net": None,
+        "p20_steam_net": None,
+        "p80_steam_net": None,
         "change_pct": None,
         "lowest_platform": None,
         "forecast_balance_ratio": None,
+        "risk_balance_ratio": None,
+        "trend_regime": "unknown",
+        "probability_up": None,
+        "interval_source": None,
+        "exact_t7_validation_count": 0,
+        "bias_correction_pct": None,
         "validation_error_pct": None,
         "validation_sample_count": 0,
         "diagnostics": {},
@@ -544,13 +664,30 @@ def forecast_seven_days(
     if coverage < MIN_COVERAGE:
         return {
             **base, "status": "insufficient_coverage",
-            "reasons": ["两小时行情覆盖不足 80%"],
+            "reasons": ["按日历史覆盖不足 70%"],
+        }, grid, daily
+    latest_day = daily[-1][0]
+    current_day = snapshot.observed_at.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    if latest_day < current_day - timedelta(days=1):
+        return {
+            **base,
+            "status": "stale_history",
+            "reasons": ["最近历史日缺失"],
         }, grid, daily
 
     evaluated = _evaluate_forecast_candidates(daily, snapshot.steam_net)
     selected = _select_forecast_candidate(evaluated)
     return _assemble_forecast_result(
-        base, selected, evaluated, snapshot, lowest, span_days
+        base,
+        selected,
+        evaluated,
+        snapshot,
+        lowest,
+        span_days,
+        daily,
+        pooled_residuals_by_mode,
     ), grid, daily
 
 
@@ -613,40 +750,30 @@ def _risk_floor_metrics(
     forecast: dict[str, Any],
 ) -> tuple[float | None, float | None, float | None]:
     lowest = snapshot.lowest_platform
-    p25 = t7_stats.get("t7_steam_net_p25")
-    predicted = (
-        float(forecast["predicted_steam_net"])
-        if forecast.get("status") == "ready" else None
+    risk_net = (
+        float(forecast["p20_steam_net"])
+        if forecast.get("status") == "ready"
+        and forecast.get("p20_steam_net") is not None
+        else None
     )
-    candidates = [snapshot.steam_net]
-    if p25 is not None and float(p25) > 0:
-        candidates.append(float(p25))
-    if predicted is not None and predicted > 0:
-        candidates.append(predicted)
-    valid_candidates = [value for value in candidates if value > 0]
-    risk_net = min(valid_candidates) if valid_candidates else None
     platform_price = float(lowest[1]) if lowest else None
     risk_ratio = (
         platform_price / risk_net
         if platform_price is not None and risk_net is not None else None
     )
-    t7_ratio = (
-        platform_price / float(p25)
-        if platform_price is not None and p25 is not None and float(p25) > 0 else None
+    downside = (
+        risk_net / snapshot.steam_net - 1
+        if risk_net is not None and snapshot.steam_net > 0 else None
     )
-    ratio_delta = (
-        risk_ratio - t7_ratio
-        if risk_ratio is not None and t7_ratio is not None else None
-    )
-    return risk_net, risk_ratio, ratio_delta
+    return risk_net, risk_ratio, downside
 
 
 def _assess_price_risk(
-    forecast_change: float | None, ratio_delta: float | None,
+    forecast_change: float | None, downside_change: float | None,
     volume_change: float | None,
 ) -> dict[str, Any]:
     price_reasons: list[str] = []
-    if forecast_change is None and ratio_delta is None:
+    if forecast_change is None and downside_change is None:
         return _dimension(
             "unavailable", "unknown", {}, ["预测与比例数据不足"]
         )
@@ -659,10 +786,14 @@ def _assess_price_risk(
         elif forecast_change <= -0.02:
             level = "medium"
             price_reasons.append(f"预计七日下跌 {abs(forecast_change):.1%}")
-    if ratio_delta is not None and ratio_delta >= 0.02:
-        if LEVEL_ORDER[level] < LEVEL_ORDER["medium"]:
-            level = "medium"
-        price_reasons.append(f"风险比例较 P25 比例高 {ratio_delta:.1%}")
+    if downside_change is not None:
+        if downside_change <= -0.10:
+            level = "high"
+            price_reasons.append(f"P20 下行情景较现价低 {abs(downside_change):.1%}")
+        elif downside_change <= -0.05:
+            if LEVEL_ORDER[level] < LEVEL_ORDER["medium"]:
+                level = "medium"
+            price_reasons.append(f"P20 下行情景较现价低 {abs(downside_change):.1%}")
     if forecast_change is not None and volume_change is not None:
         if forecast_change <= -0.02 and volume_change >= 0.10:
             level = _upgrade(level)
@@ -670,14 +801,16 @@ def _assess_price_risk(
     if not price_reasons:
         price_reasons.append("未发现明显价格下行压力")
     return _dimension(
-        "ready" if forecast_change is not None else "partial", level,
+        "ready" if forecast_change is not None and downside_change is not None
+        else "partial", level,
         {
             "forecast_change_pct": (
                 round(forecast_change * 100, 2)
                 if forecast_change is not None else None
             ),
-            "risk_vs_t7_ratio_delta_pct": (
-                round(ratio_delta * 100, 2) if ratio_delta is not None else None
+            "p20_downside_pct": (
+                round(downside_change * 100, 2)
+                if downside_change is not None else None
             ),
             "volume_confirmation": bool(
                 forecast_change is not None and volume_change is not None
@@ -688,7 +821,7 @@ def _assess_price_risk(
 
 
 def _assess_volatility_risk(
-    daily: list[tuple[datetime, float]],
+    daily: list[tuple[datetime, float]], steam_volume: float | None,
 ) -> dict[str, Any]:
     returns = [
         math.log(second / first)
@@ -718,7 +851,17 @@ def _assess_volatility_risk(
             if prior_variance > 1e-12
             else (math.inf if recent_variance > 1e-12 else 1.0)
         )
-    level = "high" if sigma7 >= 0.07 else "medium" if sigma7 >= 0.03 else "low"
+    cohort = volume_cohort(steam_volume)
+    if cohort in {"unknown", "volume_lt_5", "volume_5_99"}:
+        medium_threshold, high_threshold = 0.20, 0.40
+    elif cohort == "volume_100_999":
+        medium_threshold, high_threshold = 0.10, 0.25
+    else:
+        medium_threshold, high_threshold = 0.05, 0.15
+    level = (
+        "high" if sigma7 >= high_threshold
+        else "medium" if sigma7 >= medium_threshold else "low"
+    )
     volatility_reasons = [f"七日波动率 {sigma7:.1%}"]
     if variance_ratio is not None and variance_ratio >= 1.5 and sigma7 >= 0.02:
         level = _upgrade(level)
@@ -735,6 +878,9 @@ def _assess_volatility_risk(
             "variance_ratio_infinite": bool(
                 variance_ratio is not None and math.isinf(variance_ratio)
             ),
+            "volume_cohort": cohort,
+            "medium_threshold_pct": round(medium_threshold * 100, 2),
+            "high_threshold_pct": round(high_threshold * 100, 2),
         }, volatility_reasons,
     )
 
@@ -826,14 +972,18 @@ def _assess_volume_risk(
 
     level = "low"
     volume_reasons = []
-    if volume_median == 0:
+    if volume_median < 5:
         level = "high"
-        volume_reasons.append("最近七日成交量为零")
-    elif volume_change is not None and volume_change <= -0.25:
+        volume_reasons.append(f"最近七日成交量中位数仅 {volume_median:.0f}")
+    elif volume_median < 100:
+        level = "medium"
+        volume_reasons.append(f"最近七日成交量中位数为 {volume_median:.0f}")
+    if volume_change is not None and volume_change <= -0.25:
         level = "high"
         volume_reasons.append(f"成交量下降 {abs(volume_change):.1%}")
     elif volume_change is not None and volume_change <= -0.10:
-        level = "medium"
+        if LEVEL_ORDER[level] < LEVEL_ORDER["medium"]:
+            level = "medium"
         volume_reasons.append(f"成交量下降 {abs(volume_change):.1%}")
     if forecast_change is not None and volume_change is not None:
         if forecast_change <= -0.05 and volume_change >= 0.20:
@@ -864,10 +1014,20 @@ def _aggregate_risk(
     risk_ratio: float | None,
 ) -> dict[str, Any]:
     available = [value for value in dimensions.values() if value["level"] != "unknown"]
-    overall = (
-        max(available, key=lambda value: LEVEL_ORDER[value["level"]])["level"]
-        if available else "unknown"
+    high_count = sum(value["level"] == "high" for value in available)
+    medium_count = sum(value["level"] == "medium" for value in available)
+    price_level = dimensions.get("price", {}).get("level", "unknown")
+    data_incomplete = (
+        price_level == "unknown" or risk_net is None or risk_ratio is None
     )
+    if not available or data_incomplete:
+        overall = "unknown"
+    elif price_level == "high" or high_count >= 2:
+        overall = "high"
+    elif high_count >= 1 or medium_count >= 2:
+        overall = "medium"
+    else:
+        overall = "low"
     overall_reasons = [
         value["reasons"][0]
         for value in dimensions.values()
@@ -881,12 +1041,15 @@ def _aggregate_risk(
         ])
 
     return {
-        "status": "ready" if available else "unavailable",
+        "status": (
+            "ready" if available and not data_incomplete else "insufficient_data"
+        ),
         "overall_level": overall,
         "confidence": "normal" if len(available) >= 3 else "low",
         "risk_steam_net": round(risk_net, 4) if risk_net is not None else None,
         "risk_balance_ratio": round(risk_ratio, 4) if risk_ratio is not None else None,
         "dimensions": dimensions,
+        "aggregation": "multi_signal_v1",
         "reasons": overall_reasons[:3],
     }
 
@@ -895,7 +1058,7 @@ def assess_risk(
     grid: list[dict[str, Any]], daily: list[tuple[datetime, float]],
     snapshot: MarketSnapshot, t7_stats: dict[str, Any], forecast: dict[str, Any],
 ) -> dict[str, Any]:
-    risk_net, risk_ratio, ratio_delta = _risk_floor_metrics(
+    risk_net, risk_ratio, downside_change = _risk_floor_metrics(
         snapshot, t7_stats, forecast
     )
     last_day = daily[-1][0] if daily else snapshot.observed_at.replace(
@@ -910,9 +1073,11 @@ def assess_risk(
     )
     dimensions = {
         "price": _assess_price_risk(
-            forecast_change, ratio_delta, volume_change
+            forecast_change, downside_change, volume_change
         ),
-        "volatility": _assess_volatility_risk(daily),
+        "volatility": _assess_volatility_risk(
+            daily, snapshot.steam_transaction_quantity
+        ),
         "inventory": _assess_inventory_risk(grid),
         "volume": _assess_volume_risk(
             volume_median, volume_change, recent_volume_days,
@@ -927,6 +1092,7 @@ def forecast_and_risk(
     t7_stats: dict[str, Any], *, stale: bool = False,
     now: datetime | None = None,
     max_current_lag_seconds: int | None = None,
+    pooled_residuals_by_mode: dict[str, list[float]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     forecast, grid, daily = forecast_seven_days(
         rows,
@@ -934,6 +1100,7 @@ def forecast_and_risk(
         stale=stale,
         now=now,
         max_current_lag_seconds=max_current_lag_seconds,
+        pooled_residuals_by_mode=pooled_residuals_by_mode,
     )
     if stale:
         unavailable = _dimension(

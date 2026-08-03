@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from core.market import MarketSnapshot
 from core.risk import (
+    _aggregate_risk,
     assess_risk,
     canonical_two_hour_rows,
     forecast_and_risk,
@@ -136,7 +137,7 @@ class ForecastSelectionTestCase(unittest.TestCase):
         self.assertEqual(forecast["status"], "ready")
         self.assertIsNone(forecast["forecast_balance_ratio"])
 
-    def test_history_only_fills_grid_not_current_observation(self):
+    def test_native_timestamps_are_preserved_without_two_hour_bucketing(self):
         history = make_snapshot(NOW - timedelta(minutes=20), 12.0, kind="history")
         current = make_snapshot(NOW - timedelta(minutes=10), 10.0)
 
@@ -144,9 +145,51 @@ class ForecastSelectionTestCase(unittest.TestCase):
             [as_row(history), as_row(current)], now=NOW
         )
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["kind"], "current")
-        self.assertEqual(rows[0]["steam_sell_price"], 10.0)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["kind"] for row in rows], ["history", "current"])
+
+    def test_probabilistic_fields_are_ordered_and_directional(self):
+        prices = [20.0 + index * 0.25 for index in range(30)]
+        forecast, _, _ = forecast_seven_days(
+            series_rows(prices), make_snapshot(NOW, prices[-1]), now=NOW
+        )
+
+        self.assertLessEqual(
+            forecast["p20_steam_net"], forecast["predicted_steam_net"]
+        )
+        self.assertLessEqual(
+            forecast["predicted_steam_net"], forecast["p80_steam_net"]
+        )
+        self.assertEqual(forecast["trend_regime"], "up")
+        self.assertGreaterEqual(forecast["exact_t7_validation_count"], 4)
+        self.assertGreater(forecast["probability_up"], 0.5)
+
+    def test_pooled_interval_precedes_volatility_cold_start(self):
+        rows = series_rows([10.0] * 18)
+        current = make_snapshot(NOW, 10.0)
+        cold, _, _ = forecast_seven_days(rows, current, now=NOW)
+        pooled, _, _ = forecast_seven_days(
+            rows,
+            current,
+            now=NOW,
+            pooled_residuals_by_mode={"persistence": [-0.1] * 15 + [0.1] * 15},
+        )
+
+        self.assertEqual(cold["interval_source"], "realized_volatility")
+        self.assertEqual(pooled["interval_source"], "cohort_exact_t7")
+
+    def test_latest_history_day_is_required(self):
+        old_now = NOW - timedelta(days=3)
+        rows = []
+        for index in range(21):
+            when = old_now - timedelta(days=20 - index)
+            rows.append(as_row(make_snapshot(when, 10.0)))
+
+        forecast, _, _ = forecast_seven_days(
+            rows, make_snapshot(NOW, 10.0), now=NOW
+        )
+
+        self.assertEqual(forecast["status"], "stale_history")
 
     def test_stale_current_observations_do_not_fill_forecast_coverage(self):
         rows = series_rows([10.0] * 30)
@@ -221,14 +264,18 @@ class RiskDimensionTestCase(unittest.TestCase):
         self.assertEqual(risk["dimensions"]["volatility"]["level"], "high")
         self.assertEqual(risk["overall_level"], "high")
 
-    def test_medium_volatility_boundary_is_reported(self):
+    def test_volatility_thresholds_follow_current_volume_cohort(self):
         prices = [10.0]
         for index in range(29):
-            prices.append(prices[-1] * math.exp(0.014 if index % 2 else -0.014))
+            prices.append(prices[-1] * math.exp(0.047 if index % 2 else -0.047))
 
-        risk = self._assessment(prices)
+        low_volume = self._assessment(prices, volumes=[50] * 30)
+        medium_volume = self._assessment(prices, volumes=[500] * 30)
+        high_volume = self._assessment(prices, volumes=[1000] * 30)
 
-        self.assertEqual(risk["dimensions"]["volatility"]["level"], "medium")
+        self.assertEqual(low_volume["dimensions"]["volatility"]["level"], "low")
+        self.assertEqual(medium_volume["dimensions"]["volatility"]["level"], "medium")
+        self.assertEqual(high_volume["dimensions"]["volatility"]["level"], "medium")
 
     def test_recent_variance_acceleration_upgrades_level(self):
         prices = [10.0] * 16
@@ -279,6 +326,44 @@ class RiskDimensionTestCase(unittest.TestCase):
 
         self.assertEqual(risk["dimensions"]["price"]["level"], "high")
         self.assertEqual(risk["dimensions"]["volume"]["level"], "high")
+
+    def test_absolute_liquidity_boundaries_cover_5_100_1000_scale(self):
+        prices = [10.0] * 30
+        scarce = self._assessment(prices, volumes=[4] * 30)
+        thin = self._assessment(prices, volumes=[5] * 30)
+        liquid = self._assessment(prices, volumes=[100] * 30)
+
+        self.assertEqual(scarce["dimensions"]["volume"]["level"], "high")
+        self.assertEqual(thin["dimensions"]["volume"]["level"], "medium")
+        self.assertEqual(liquid["dimensions"]["volume"]["level"], "low")
+
+    def test_multi_signal_aggregation_does_not_promote_one_medium_to_high(self):
+        def dimension(level):
+            return {"status": "ready", "level": level, "metrics": {}, "reasons": [level]}
+
+        medium = _aggregate_risk(
+            {
+                "price": dimension("low"),
+                "volatility": dimension("medium"),
+                "inventory": dimension("medium"),
+                "volume": dimension("low"),
+            },
+            9.0,
+            0.8,
+        )
+        high = _aggregate_risk(
+            {
+                "price": dimension("low"),
+                "volatility": dimension("high"),
+                "inventory": dimension("high"),
+                "volume": dimension("low"),
+            },
+            9.0,
+            0.8,
+        )
+
+        self.assertEqual(medium["overall_level"], "medium")
+        self.assertEqual(high["overall_level"], "high")
 
     def test_forecast_and_risk_are_separate_objects(self):
         rows = series_rows([10.0] * 30)

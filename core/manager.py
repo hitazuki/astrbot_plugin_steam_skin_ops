@@ -11,6 +11,11 @@ from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
 
 from .alerting import evaluate_rule_transition
+from .candidate_features import (
+    RANKING_POLICY_VERSION,
+    build_candidate_record,
+)
+from .evaluation import ForecastEvaluationStorage
 from .history import seven_day_history_stats
 from .history_backfill import HistoryBackfiller
 from .integrations.smis import MarketDataProvider
@@ -28,7 +33,7 @@ from .recommendation import (
     score_recommendation,
 )
 from .repository import MonitorStorage, RuleItemLimitError
-from .risk import forecast_and_risk
+from .risk import FORECAST_MODEL_VERSION, forecast_and_risk, volume_cohort
 from .rules import (
     MAX_RULE_STATE_INTEGER,
     RuleMeasurement,
@@ -87,6 +92,7 @@ class MonitoringManager:
         breakthrough_step_percent: float = 3,
         poll_interval_seconds: int = 1800,
         recommendation_policy: RecommendationPolicy | None = None,
+        evaluation_storage: ForecastEvaluationStorage | None = None,
     ) -> None:
         self.storage = storage
         self.source = source
@@ -98,6 +104,7 @@ class MonitoringManager:
         self.health_failure_threshold = max(1, int(health_failure_threshold))
         self.poll_interval_seconds = max(1, int(poll_interval_seconds))
         self.recommendation_policy = recommendation_policy or RecommendationPolicy()
+        self.evaluation_storage = evaluation_storage
         self.history_backfiller = HistoryBackfiller(
             storage,
             source,
@@ -185,7 +192,7 @@ class MonitoringManager:
 
     def _sync_t7_rule_basis(self) -> None:
         key = "alerting:t7_basis"
-        value = "seven_day_dynamic_forecast:v1"
+        value = FORECAST_MODEL_VERSION
         if self.storage.get_metadata(key) == value:
             return
         self.storage.reset_rule_states("t7", operational_only=True)
@@ -431,19 +438,33 @@ class MonitoringManager:
                 max_current_lag_seconds=self.poll_interval_seconds,
             )
         )
+        pooled = self._pooled_residuals(snapshot)
         forecast, risk = forecast_and_risk(
             cached["rows"],
             snapshot,
             stats,
             max_current_lag_seconds=self.poll_interval_seconds,
+            pooled_residuals_by_mode=pooled,
         )
-        return score_recommendation(
+        scored = score_recommendation(
             row,
             forecast,
             risk,
             policy,
             history_age_hours=float(cached["age_hours"]),
         )
+        if scored is not None:
+            scored["volume_cohort"] = volume_cohort(
+                snapshot.steam_transaction_quantity
+            )
+            scored["recommendation_candidate"] = build_candidate_record(
+                snapshot,
+                cached["rows"],
+                forecast,
+                risk,
+                ranking={**scored, "instant_balance_ratio": row.get("ratio")},
+            )
+        return scored
 
     def recommend(
         self,
@@ -594,7 +615,11 @@ class MonitoringManager:
             "recommendations": scored[: policy.result_limit],
             "analysis_pool_count": len(pool),
             "analyzed_count": len(scored),
-            "strategy": "t7_risk_instant_score_v2",
+            "strategy": RANKING_POLICY_VERSION,
+            "candidate_records": [
+                row["recommendation_candidate"]
+                for row in scored[: policy.result_limit]
+            ],
             "diagnostics": diagnostics,
         }
 
@@ -964,6 +989,14 @@ class MonitoringManager:
             stats,
             stale=stale,
             max_current_lag_seconds=self.poll_interval_seconds,
+            pooled_residuals_by_mode=self._pooled_residuals(snapshot),
+        )
+
+    def _pooled_residuals(self, snapshot: MarketSnapshot) -> dict[str, list[float]]:
+        if self.evaluation_storage is None:
+            return {}
+        return self.evaluation_storage.pooled_residuals(
+            volume_cohort(snapshot.steam_transaction_quantity)
         )
 
     def monitor_item(self, item_row: dict) -> dict:
@@ -1008,6 +1041,9 @@ class MonitoringManager:
             stats,
             stale=stale,
         )
+        if self.evaluation_storage is not None:
+            self.evaluation_storage.resolve(snapshot, stale=stale)
+            self.evaluation_storage.mark_missed(snapshot.observed_at)
         unavailable_status = "行情数据已过期" if stale else None
         for rule in rules:
             self._evaluate_rule(
@@ -1088,6 +1124,8 @@ class MonitoringManager:
         key = "daily_summary:last_date"
         if self.storage.get_metadata(key) == date_text:
             return 0
+
+        self._issue_daily_forecasts(summary_date)
 
         grouped: dict[str, list[tuple[dict, dict, int, float]]] = defaultdict(list)
         item_freshness: dict[str, bool] = {}
@@ -1190,6 +1228,42 @@ class MonitoringManager:
             ))
         self.storage.set_metadata(key, date_text)
         return queued
+
+    def _issue_daily_forecasts(self, issue_date: date) -> int:
+        if self.evaluation_storage is None:
+            return 0
+        issued = 0
+        seen: set[str] = set()
+        for rule in self.storage.list_rules(operational_only=True):
+            item_key = str(rule["item_key"])
+            if item_key in seen:
+                continue
+            seen.add(item_key)
+            latest = self.storage.latest_snapshot(item_key)
+            if not latest:
+                continue
+            snapshot = self._snapshot_from_row(latest)
+            stale = (
+                self._snapshot_age_seconds(latest) > self.poll_interval_seconds * 2
+                or self._source_snapshot_stale(latest)
+            )
+            stats = self._seven_day_history_stats(item_key)
+            forecast, risk = self._forecast_and_risk(
+                item_key, snapshot, stats, stale=stale
+            )
+            rows = self.storage.market_history_rows(item_key, days=30)
+            feature_record = build_candidate_record(
+                snapshot, rows, forecast, risk
+            )
+            issued += int(
+                self.evaluation_storage.issue(
+                    snapshot,
+                    forecast,
+                    feature_record,
+                    issue_date=issue_date,
+                )
+            )
+        return issued
 
     def _handle_item_failure(self, item: dict, rules: list[dict], exc: Exception) -> None:
         for recipient_key in sorted({str(rule["recipient_key"]) for rule in rules}):
