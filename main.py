@@ -12,6 +12,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from .core.config import ConfigError, PluginSettings, load_settings
 from .core.evaluation import ForecastEvaluationStorage
 from .core.integrations.smis import SmisClient
+from .core.llm_analysis import LlmAnalysisError, LlmAnalysisService
 from .core.manager import MonitoringManager, ServiceError
 from .core.presentation import format_quote, format_recommendations
 from .core.recommendation import RecommendationPolicy
@@ -26,6 +27,11 @@ HELP_TEXT = """Steam Skin Ops 命令：
 /skin search <名称> - 搜索 SMIS 饰品 ID
 /skin quote <SMIS_ID|名称> - 全市场即时查询
 /skin recommend [最高价] [最低价] [最低Steam日成交量] - 确定性挂刀 Top 5
+/skin ai quote <SMIS_ID|名称> - AI 解读单品确定性结果
+/skin ai recommend [最高价] [最低价] [最低Steam日成交量] - AI 解读确定性 Top 5
+/skin ai compare <ID1,ID2[,ID3...]> - AI 比较 2～5 个饰品
+/skin ai eval [7|30|90|180] [all|lt100|100-999|1000+] - 管理员评估摘要
+/skin ai status - 查看当前会话 AI 分析状态
 /skin rule add <SMIS_ID|名称> <ratio|t7|platform|steam> <阈值>
 /skin rule list [SMIS_ID] - 当前会话规则
 /skin rule set <RULE_ID> <新阈值>
@@ -48,6 +54,7 @@ class SteamSkinOpsPlugin(Star):
             self.settings = None
             self.config_errors = exc.errors
             self.source = self.storage = self.manager = self.runtime = None
+            self.llm_analysis = None
             logger.error("Steam Skin Ops 配置无效：%s", "；".join(exc.errors))
             return
 
@@ -78,6 +85,13 @@ class SteamSkinOpsPlugin(Star):
             ),
             evaluation_storage=self.evaluation_storage,
         )
+        self.llm_analysis = LlmAnalysisService(
+            enabled=self.settings.llm_analysis_enabled,
+            calls_per_window=self.settings.llm_calls_per_window,
+            window_seconds=self.settings.llm_rate_window_seconds,
+            timeout_seconds=self.settings.llm_timeout_seconds,
+            max_concurrency=self.settings.llm_max_concurrency,
+        )
         self._dispatch_lock = asyncio.Lock()
         self.runtime = PluginRuntime(
             self.manager,
@@ -97,8 +111,55 @@ class SteamSkinOpsPlugin(Star):
             )
         return self.manager
 
-    async def _call(self, func, *args):
-        return await asyncio.to_thread(func, *args)
+    async def _call(self, func, *args, **kwargs):
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    async def _generate_analysis(
+        self, provider_id: str, prompt: str, system_prompt: str
+    ) -> str:
+        response = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            max_tokens=800,
+            temperature=0.2,
+        )
+        return str(response.completion_text or "")
+
+    async def _ai_text(
+        self,
+        event: AstrMessageEvent,
+        *,
+        task: str,
+        candidates: list[dict] | None = None,
+        evaluation_summary: dict | None = None,
+    ) -> str:
+        if self.llm_analysis is None:
+            raise LlmAnalysisError("AI 分析服务不可用")
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(
+                umo=event.unified_msg_origin
+            )
+        except Exception as exc:
+            raise LlmAnalysisError("当前会话未配置可用 AI Provider") from exc
+        if not provider_id:
+            raise LlmAnalysisError("当前会话未配置可用 AI Provider")
+        result = await self.llm_analysis.analyze(
+            umo=event.unified_msg_origin,
+            provider_id=provider_id,
+            task=task,
+            candidates=candidates,
+            evaluation_summary=evaluation_summary,
+            generate=self._generate_analysis,
+        )
+        suffix = "（缓存）" if result.cached else ""
+        return f"AI 解读{suffix}：\n{result.text}"
+
+    async def _with_ai_fallback(self, deterministic: str, analysis) -> str:
+        try:
+            return deterministic + "\n\n" + await analysis
+        except Exception as exc:
+            return deterministic + f"\n\nAI 解读不可用：{self._error_text(exc)}"
 
     async def _dispatch_outbox(self) -> dict[str, int]:
         self._require_manager()
@@ -130,6 +191,8 @@ class SteamSkinOpsPlugin(Star):
 
     @staticmethod
     def _error_text(exc: Exception) -> str:
+        if isinstance(exc, LlmAnalysisError):
+            return str(exc)
         if isinstance(exc, ServiceError):
             if not exc.data:
                 return exc.message
@@ -213,6 +276,167 @@ class SteamSkinOpsPlugin(Star):
             yield event.plain_result("\n".join(lines))
         except Exception as exc:
             yield event.plain_result(f"查询失败：{self._error_text(exc)}")
+
+    @skin.group("ai")
+    def ai():
+        """只读 AI 行情解释。"""
+        pass
+
+    @ai.command("quote")
+    async def ai_quote(self, event: AstrMessageEvent, query: str):
+        """解释单个饰品的确定性行情和风险。"""
+        try:
+            data = await self._call(self._require_manager().quote, query)
+            deterministic = format_quote(data)
+            analysis = self._ai_text(
+                event,
+                task="quote_explanation",
+                candidates=[data["recommendation_candidate"]],
+            )
+            yield event.plain_result(
+                await self._with_ai_fallback(deterministic, analysis)
+            )
+        except Exception as exc:
+            yield event.plain_result(f"AI 行情解读失败：{self._error_text(exc)}")
+
+    @ai.command("recommend")
+    async def ai_recommend(
+        self,
+        event: AstrMessageEvent,
+        max_price: float | None = None,
+        min_price: float | None = None,
+        min_steam_volume: int | None = None,
+    ):
+        """解释确定性推荐 Top 5，不改变排名。"""
+        try:
+            data = await self._call(
+                self._require_manager().recommend,
+                max_price,
+                min_price,
+                min_steam_volume,
+            )
+            deterministic = format_recommendations(data)
+            candidates = data.get("candidate_records") or []
+            if not candidates:
+                yield event.plain_result(deterministic)
+                return
+            analysis = self._ai_text(
+                event,
+                task="recommendation_explanation",
+                candidates=candidates,
+            )
+            yield event.plain_result(
+                await self._with_ai_fallback(deterministic, analysis)
+            )
+        except Exception as exc:
+            yield event.plain_result(f"AI 推荐解读失败：{self._error_text(exc)}")
+
+    @ai.command("compare")
+    async def ai_compare(self, event: AstrMessageEvent, smis_ids: str):
+        """比较 2～5 个逗号分隔的 SMIS ID。"""
+        try:
+            tokens = [value.strip() for value in smis_ids.replace("，", ",").split(",")]
+            if not 2 <= len(tokens) <= 5 or any(not value.isdigit() for value in tokens):
+                raise ServiceError(422, "invalid_compare_items", "请提供 2～5 个逗号分隔的 SMIS ID")
+            ids = [int(value) for value in tokens]
+            if len(set(ids)) != len(ids):
+                raise ServiceError(422, "duplicate_compare_items", "比较列表不能包含重复 ID")
+            rows = [
+                await self._call(self._require_manager().quote, str(smis_id))
+                for smis_id in ids
+            ]
+            lines = ["确定性比较（保持输入顺序）："]
+            for index, row in enumerate(rows, 1):
+                forecast = row.get("forecast") or {}
+                risk = row.get("risk_assessment") or {}
+                lines.append(
+                    f"{index}. {row['name_zh']}（SMIS {row['smis_id']}） · "
+                    f"即时 {float(row.get('ratio') or 0):.2%} · "
+                    f"P50 {float(forecast.get('forecast_balance_ratio') or 0):.2%} · "
+                    f"P20 压力 {float(risk.get('risk_balance_ratio') or 0):.2%} · "
+                    f"风险 {risk.get('overall_level') or 'unknown'}"
+                )
+            deterministic = "\n".join(lines)
+            analysis = self._ai_text(
+                event,
+                task="comparison",
+                candidates=[row["recommendation_candidate"] for row in rows],
+            )
+            yield event.plain_result(
+                await self._with_ai_fallback(deterministic, analysis)
+            )
+        except Exception as exc:
+            yield event.plain_result(f"AI 比较失败：{self._error_text(exc)}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @ai.command("eval")
+    async def ai_evaluation(
+        self,
+        event: AstrMessageEvent,
+        days: int = 30,
+        cohort: str = "all",
+    ):
+        """解释预测评估聚合指标。"""
+        try:
+            if days not in {7, 30, 90, 180} or cohort not in {
+                "all", "lt100", "100-999", "1000+",
+            }:
+                raise ServiceError(
+                    422,
+                    "invalid_evaluation_filter",
+                    "用法：/skin ai eval [7|30|90|180] "
+                    "[all|lt100|100-999|1000+]",
+                )
+            summary = await self._call(
+                self.evaluation_storage.summary, days=days, cohort=cohort
+            )
+            lines = [
+                f"确定性预测评估：最近 {summary['days']} 天 · {summary['cohort_filter']}",
+                f"签发 {summary['issued_count']} · 状态 {summary['status_counts']}",
+            ]
+            for group in summary["groups"]:
+                lines.append(
+                    f"- {group['volume_cohort']}/{group['mode']}："
+                    f"n={group['resolved_count']} · MAE {group['mae_pct']:.2f}% · "
+                    f"方向 {group['direction_accuracy']:.1%} · "
+                    f"区间命中 {group['interval_coverage']:.1%} · {group['sample_quality']}"
+                )
+            deterministic = "\n".join(lines)
+            analysis = self._ai_text(
+                event,
+                task="evaluation_summary",
+                evaluation_summary=summary,
+            )
+            yield event.plain_result(
+                await self._with_ai_fallback(deterministic, analysis)
+            )
+        except Exception as exc:
+            yield event.plain_result(f"AI 评估失败：{self._error_text(exc)}")
+
+    @ai.command("status")
+    async def ai_status(self, event: AstrMessageEvent):
+        """查看当前会话 AI 分析状态，不调用模型。"""
+        try:
+            if self.llm_analysis is None:
+                raise LlmAnalysisError("AI 分析服务不可用")
+            status = self.llm_analysis.status(event.unified_msg_origin)
+            provider = "不可用"
+            if status["enabled"]:
+                try:
+                    provider = await self.context.get_current_chat_provider_id(
+                        umo=event.unified_msg_origin
+                    )
+                except Exception:
+                    pass
+            yield event.plain_result("\n".join([
+                f"AI 分析启用：{'是' if status['enabled'] else '否'}",
+                f"当前 Provider：{provider}",
+                f"会话剩余额度：{status['remaining']}/{status['limit']}（"
+                f"{status['window_seconds']} 秒窗口）",
+                f"运行计数：{status['stats']}",
+            ]))
+        except Exception as exc:
+            yield event.plain_result(f"AI 状态查询失败：{self._error_text(exc)}")
 
     async def _resolve_smis_id(self, query: str) -> int:
         return await self._call(self._require_manager().resolve_smis_id, query)

@@ -168,7 +168,7 @@ risk_balance_ratio = 最低平台价 ÷ P20
 
 JSON Schema 位于
 [`recommendation_candidate.v1.schema.json`](recommendation_candidate.v1.schema.json)。
-未来大模型只能解释、比较和总结确定性 Top N，必须引用字段路径，不能更改准入或分数。
+大模型只能解释、比较和总结确定性 Top N，必须引用字段路径，不能更改准入或分数。
 
 ## 7. 长期评估闭环
 
@@ -184,7 +184,25 @@ JSON Schema 位于
 - 签发、结果、结构化特征和校准残差保留 180 天；行情快照保留 30 天；推荐专用
   缓存按 14 天未使用规则清理。
 
-## 8. 持久化规则兼容性
+## 8. AI 解读契约
+
+`/skin ai` 是确定性计算之后的可选只读解释层，默认关闭。插件使用当前 AstrBot 会话
+Provider，通过 `skin_llm_analysis_request.v1` 传入以下内容：
+
+- `task`：单品解释、Top 5 解释、2～5 项比较或评估汇总；
+- `candidates`：已有 `recommendation_candidate.v1` 记录；
+- `evaluation_summary`：管理员指定 7/30/90/180 日及成交量层的聚合误差、方向准确率
+  和 P20～P80 区间覆盖率；
+- `response_contract`：明确禁止改写准入、分数、风险或触发操作。
+
+请求不包含 `unified_msg_origin`、recipient 或聊天历史。模型输出只允许“结论、主要依据、
+不确定性”三段，至少引用两个形如 `【candidates.0.model_output.forecast...】` 的真实字段
+路径；未知路径、章节缺失或引用不足会被拒绝。确定性结果总是先展示，模型失败不会
+改变结果，也不会影响规则与告警。调用按会话限流、全局限制并发，输入结果缓存 10 分钟；
+提示词、输出和运行计数仅在内存中存在，不进入 `monitor.db` 或
+`forecast_evaluation.db`。
+
+## 9. 持久化规则兼容性
 
 | 规则 | 判断值 |
 | --- | --- |

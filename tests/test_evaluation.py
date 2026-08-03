@@ -135,6 +135,32 @@ class ForecastEvaluationStorageTestCase(unittest.TestCase):
             json.loads(payload)["schema_version"], "recommendation_candidate.v1"
         )
 
+    def test_summary_groups_resolved_metrics_without_schema_change(self):
+        recent = datetime.now(timezone.utc) - timedelta(days=8)
+        self._issue(recent)
+        self.assertEqual(
+            self.storage.resolve(
+                snapshot(recent + timedelta(days=7)), stale=False
+            ),
+            1,
+        )
+
+        summary = self.storage.summary(days=30, cohort="100-999")
+
+        self.assertEqual(summary["schema_version"], "forecast_evaluation_summary.v1")
+        self.assertEqual(summary["issued_count"], 1)
+        self.assertEqual(summary["status_counts"], {"resolved": 1})
+        self.assertEqual(summary["groups"][0]["volume_cohort"], "volume_100_999")
+        self.assertEqual(summary["groups"][0]["resolved_count"], 1)
+        self.assertEqual(summary["groups"][0]["sample_quality"], "small_sample")
+        self.assertEqual(EVALUATION_SCHEMA_VERSION, 1)
+
+    def test_summary_rejects_unsupported_window_and_cohort(self):
+        with self.assertRaises(ValueError):
+            self.storage.summary(days=14)
+        with self.assertRaises(ValueError):
+            self.storage.summary(cohort="unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,13 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 /skin quote <SMIS_ID|名称>                 查询全市场报价和风险
 /skin recommend [最高价] [最低价] [最低Steam日成交量]
                                             确定性综合挂刀 Top 5
+/skin ai quote <SMIS_ID|名称>                AI 解读单品确定性结果
+/skin ai recommend [最高价] [最低价] [最低Steam日成交量]
+                                            AI 解读确定性 Top 5
+/skin ai compare <ID1,ID2[,ID3...]>         AI 比较 2～5 个 SMIS ID
+/skin ai eval [7|30|90|180] [all|lt100|100-999|1000+]
+                                            管理员查看并解读预测评估
+/skin ai status                             查看本会话 AI 状态和额度
 /skin items                                查看已监控饰品
 /skin rule list [SMIS_ID]                  查看当前会话规则
 /skin rule add <目标> <ratio|t7|platform|steam> <阈值>
@@ -29,7 +36,10 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 /skin help                                 显示帮助
 ```
 
-`search`、`quote`、`recommend`、`items`、`rule list` 和 `help` 对普通用户开放；修改规则、推送测试和状态管理要求 AstrBot 管理员权限。规则使用 `unified_msg_origin` 隔离，不同会话只能查看和修改自己的规则。
+`search`、`quote`、`recommend`、`ai quote`、`ai recommend`、`ai compare`、
+`ai status`、`items`、`rule list` 和 `help` 对普通用户开放；`ai eval`、修改规则、
+推送测试和状态管理要求 AstrBot 管理员权限。规则和 AI 调用额度均按
+`unified_msg_origin` 隔离。
 
 比例规则的阈值使用百分数，例如 `72` 表示 `72%`；价格规则使用人民币金额。
 
@@ -52,6 +62,11 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 | `recommend_max_ratio_percent` | `80` | 推荐候选最高即时挂刀比例 |
 | `recommend_min_steam_volume` | `50` | 推荐候选默认最低 Steam 日成交量；命令可临时覆盖至最低 1 |
 | `recommend_max_age_minutes` | `120` | 推荐候选最大行情年龄 |
+| `llm_analysis_enabled` | `false` | 是否开放 `/skin ai` 模型解读；确定性命令不受影响 |
+| `llm_calls_per_window` | `3` | 每个会话在限流窗口内最多发起的模型调用数 |
+| `llm_rate_window_seconds` | `600` | AI 会话限流窗口 |
+| `llm_timeout_seconds` | `60` | 单次 AI Provider 调用超时 |
+| `llm_max_concurrency` | `2` | 全插件并发 AI 调用上限 |
 
 配置不合法时插件不会启动后台任务，`/skin status` 会列出需要修复的字段。
 
@@ -78,7 +93,20 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 推荐策略标识为 `t7_risk_instant_score_v3`。每个结果同时生成符合
 [`recommendation_candidate.v1`](docs/recommendation_candidate.v1.schema.json)
 的结构化记录，保存市场观测、21 日日序列、P20/P50/P80、风险、确定性分项与扣分。
-结构为未来大模型解释预留，但模型只能解释和比较确定性 Top N，不能改变准入或分数。
+结构供大模型解读使用，但模型只能解释和比较确定性 Top N，不能改变准入或分数。
+
+## AI 只读解读
+
+AI 功能默认关闭。启用 `llm_analysis_enabled` 后，插件复用当前 AstrBot 会话已经选择的
+Provider，不保存 API Key，也不增加独立模型配置。`/skin ai quote`、`recommend` 和
+`compare` 会先完整展示确定性行情、预测、风险或排名，再附加模型解读；Provider
+不可用、超时、限流或输出校验失败时，仅降级为确定性结果，不影响普通命令。
+
+模型收到的是 `skin_llm_analysis_request.v1` 结构化数据，不包含会话 recipient，且不
+携带聊天历史。输出必须包含“结论、主要依据、不确定性”三段，并至少引用两个真实字段
+路径。模型只能解释、比较与总结，不能改写候选准入、40/35/25 分数、P20/P50/P80、
+风险等级、规则或告警，也不会触发交易。相同 Provider 与相同输入缓存 10 分钟；调用
+记录和模型输出只保存在内存，不写入数据库。
 
 ## 数据来源
 

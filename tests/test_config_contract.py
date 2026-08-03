@@ -48,6 +48,18 @@ class ConfigContractTestCase(unittest.TestCase):
                     load_settings(config)
                 self.assertIn(message, str(caught.exception))
 
+    def test_llm_limits_reject_unsafe_ranges(self):
+        for config, message in (
+            ({"llm_calls_per_window": 21}, "llm_calls_per_window"),
+            ({"llm_timeout_seconds": 121}, "llm_timeout_seconds"),
+            ({"llm_max_concurrency": 9}, "llm_max_concurrency"),
+            ({"llm_analysis_enabled": "yes"}, "llm_analysis_enabled"),
+        ):
+            with self.subTest(config=config):
+                with self.assertRaises(ConfigError) as caught:
+                    load_settings(config)
+                self.assertIn(message, str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

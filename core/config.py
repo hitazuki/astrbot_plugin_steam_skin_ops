@@ -24,6 +24,11 @@ class PluginSettings:
     recommend_max_ratio_percent: float = 80.0
     recommend_min_steam_volume: int = 50
     recommend_max_age_minutes: int = 120
+    llm_analysis_enabled: bool = False
+    llm_calls_per_window: int = 3
+    llm_rate_window_seconds: int = 600
+    llm_timeout_seconds: float = 60.0
+    llm_max_concurrency: int = 2
 
 
 class ConfigError(ValueError):
@@ -54,6 +59,10 @@ def load_settings(config: Mapping[str, Any]) -> PluginSettings:
     if not isinstance(enabled, bool):
         errors.append("enabled 必须是布尔值")
         enabled = False
+    llm_analysis_enabled = config.get("llm_analysis_enabled", False)
+    if not isinstance(llm_analysis_enabled, bool):
+        errors.append("llm_analysis_enabled 必须是布尔值")
+        llm_analysis_enabled = False
     daily_summary_time = str(config.get("daily_summary_time", "09:00")).strip()
     try:
         datetime.strptime(daily_summary_time, "%H:%M")
@@ -124,6 +133,23 @@ def load_settings(config: Mapping[str, Any]) -> PluginSettings:
             int,
             errors,
         ),
+        llm_analysis_enabled=llm_analysis_enabled,
+        llm_calls_per_window=_positive(
+            config.get("llm_calls_per_window", 3),
+            "llm_calls_per_window", int, errors,
+        ),
+        llm_rate_window_seconds=_positive(
+            config.get("llm_rate_window_seconds", 600),
+            "llm_rate_window_seconds", int, errors,
+        ),
+        llm_timeout_seconds=_positive(
+            config.get("llm_timeout_seconds", 60),
+            "llm_timeout_seconds", float, errors,
+        ),
+        llm_max_concurrency=_positive(
+            config.get("llm_max_concurrency", 2),
+            "llm_max_concurrency", int, errors,
+        ),
     )
     if settings.max_workers > 8:
         errors.append("max_workers 不能大于 8")
@@ -133,6 +159,12 @@ def load_settings(config: Mapping[str, Any]) -> PluginSettings:
         errors.append("recommend_max_price 不能小于 recommend_min_price")
     if settings.recommend_max_ratio_percent > 100:
         errors.append("recommend_max_ratio_percent 不能大于 100")
+    if settings.llm_calls_per_window > 20:
+        errors.append("llm_calls_per_window 不能大于 20")
+    if settings.llm_max_concurrency > 8:
+        errors.append("llm_max_concurrency 不能大于 8")
+    if settings.llm_timeout_seconds > 120:
+        errors.append("llm_timeout_seconds 不能大于 120")
     if errors:
         raise ConfigError(errors)
     return settings

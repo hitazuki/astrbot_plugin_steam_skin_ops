@@ -959,11 +959,16 @@ class MonitoringManager:
         forecast, risk = self._forecast_and_risk(
             str(item["item_key"]), snapshot_object, stats, stale=stale
         )
+        history_rows = self.storage.market_history_rows(str(item["item_key"]), days=30)
+        candidate_record = build_candidate_record(
+            snapshot_object, history_rows, forecast, risk
+        )
         return {
             "smis_id": int(item["smis_id"]), "appid": int(item["appid"]),
             "name": item["hash_name"], "name_zh": item["cn_name"],
             **snapshot, **stats, "forecast": forecast, "risk_assessment": risk,
             "cached": cached, "stale": stale,
+            "recommendation_candidate": candidate_record,
             "links": {
                 "smis": f"https://smis.club/commodity/{int(item['smis_id'])}",
                 "steam": f"https://steamcommunity.com/market/listings/{int(item['appid'])}/{quote(str(item['hash_name']))}",

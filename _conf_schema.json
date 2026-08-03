@@ -73,5 +73,30 @@
     "description": "挂刀推荐允许的最大行情年龄（分钟）",
     "type": "int",
     "default": 120
+  },
+  "llm_analysis_enabled": {
+    "description": "启用手动 AI 行情解释命令（不参与预测、评分或告警）",
+    "type": "bool",
+    "default": false
+  },
+  "llm_calls_per_window": {
+    "description": "每个会话在限流窗口内最多发起的 AI 分析次数",
+    "type": "int",
+    "default": 3
+  },
+  "llm_rate_window_seconds": {
+    "description": "AI 分析会话限流窗口（秒）",
+    "type": "int",
+    "default": 600
+  },
+  "llm_timeout_seconds": {
+    "description": "单次 AI Provider 调用超时（秒）",
+    "type": "float",
+    "default": 60.0
+  },
+  "llm_max_concurrency": {
+    "description": "插件全局 AI 分析最大并发数",
+    "type": "int",
+    "default": 2
   }
 }

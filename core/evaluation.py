@@ -273,6 +273,72 @@ class ForecastEvaluationStorage:
             grouped.setdefault(str(row["mode"]), []).append(float(row["log_residual"]))
         return grouped
 
+    def summary(self, *, days: int = 30, cohort: str = "all") -> dict[str, Any]:
+        allowed_days = {7, 30, 90, 180}
+        if int(days) not in allowed_days:
+            raise ValueError("评估天数只支持 7、30、90 或 180")
+        cohort_map = {
+            "all": None,
+            "lt100": ("volume_lt_5", "volume_5_99"),
+            "100-999": ("volume_100_999",),
+            "1000+": ("volume_1000_plus",),
+        }
+        if cohort not in cohort_map:
+            raise ValueError("成交量层只支持 all、lt100、100-999 或 1000+")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days))).isoformat()
+        cohort_values = cohort_map[cohort]
+        filters = ["i.issued_at>=?"]
+        params: list[Any] = [cutoff]
+        if cohort_values:
+            placeholders = ",".join("?" for _ in cohort_values)
+            filters.append(f"i.volume_cohort IN ({placeholders})")
+            params.extend(cohort_values)
+        where = " AND ".join(filters)
+        with self.connect() as conn:
+            status_rows = conn.execute(
+                f"SELECT i.status,COUNT(*) AS count FROM forecast_issuances i "
+                f"WHERE {where} GROUP BY i.status",
+                params,
+            ).fetchall()
+            metric_rows = conn.execute(
+                f"""SELECT i.volume_cohort,i.mode,COUNT(*) AS resolved_count,
+                    AVG(o.absolute_error_pct) AS mae_pct,
+                    AVG(o.signed_error_pct) AS bias_pct,
+                    AVG(o.direction_correct) AS direction_accuracy,
+                    AVG(o.interval_hit) AS interval_coverage
+                FROM forecast_issuances i
+                JOIN forecast_outcomes o ON o.issuance_id=i.id
+                WHERE {where}
+                GROUP BY i.volume_cohort,i.mode
+                ORDER BY i.volume_cohort,i.mode""",
+                params,
+            ).fetchall()
+        statuses = {str(row["status"]): int(row["count"]) for row in status_rows}
+        groups = [
+            {
+                "volume_cohort": str(row["volume_cohort"]),
+                "mode": str(row["mode"] or "unknown"),
+                "resolved_count": int(row["resolved_count"]),
+                "mae_pct": round(float(row["mae_pct"]), 2),
+                "bias_pct": round(float(row["bias_pct"]), 2),
+                "direction_accuracy": round(float(row["direction_accuracy"]), 4),
+                "interval_coverage": round(float(row["interval_coverage"]), 4),
+                "sample_quality": (
+                    "sufficient" if int(row["resolved_count"]) >= 30 else "small_sample"
+                ),
+            }
+            for row in metric_rows
+        ]
+        return {
+            "schema_version": "forecast_evaluation_summary.v1",
+            "days": int(days),
+            "cohort_filter": cohort,
+            "issued_count": sum(statuses.values()),
+            "status_counts": statuses,
+            "groups": groups,
+            "expected_interval_coverage": 0.60,
+        }
+
     def prune(self, retain_days: int = EVALUATION_RETENTION_DAYS) -> int:
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=max(1, int(retain_days)))

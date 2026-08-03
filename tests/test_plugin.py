@@ -41,11 +41,25 @@ class FakeContext:
     def __init__(self, fail=False):
         self.fail = fail
         self.messages = []
+        self.llm_calls = []
 
     async def send_message(self, umo, chain):
         if self.fail:
             raise RuntimeError("send failed")
         self.messages.append((umo, chain.text))
+
+    async def get_current_chat_provider_id(self, *, umo):
+        return f"provider:{umo}"
+
+    async def llm_generate(self, **kwargs):
+        self.llm_calls.append(kwargs)
+        return types.SimpleNamespace(
+            completion_text=(
+                "结论：数据可供解释。【candidates.0.identity.smis_id】\n"
+                "主要依据：引用现有预测。【candidates.0.model_output.p50】\n"
+                "不确定性：仍受数据质量影响。"
+            )
+        )
 
 
 def _command_decorator(*_args, **_kwargs):
@@ -182,6 +196,40 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertIn("配置无效", results[0])
             self.assertIn("max_workers", results[0])
 
+    async def test_ai_uses_current_session_provider_without_persisting_context(self):
+        with TemporaryDirectory() as tmp:
+            module = load_plugin(Path(tmp))
+            context = FakeContext()
+            plugin = module.SteamSkinOpsPlugin(
+                context,
+                {"enabled": False, "llm_analysis_enabled": True},
+            )
+            text = await plugin._ai_text(
+                FakeEvent(),
+                task="quote_explanation",
+                candidates=[
+                    {"identity": {"smis_id": 1579}, "model_output": {"p50": 10}}
+                ],
+            )
+
+            self.assertIn("AI 解读", text)
+            self.assertEqual(
+                context.llm_calls[0]["chat_provider_id"],
+                f"provider:{FakeEvent.unified_msg_origin}",
+            )
+            self.assertNotIn(FakeEvent.unified_msg_origin, context.llm_calls[0]["prompt"])
+            await plugin.terminate()
+
+    async def test_ai_status_does_not_call_model(self):
+        with TemporaryDirectory() as tmp:
+            module = load_plugin(Path(tmp))
+            context = FakeContext()
+            plugin = module.SteamSkinOpsPlugin(context, {"enabled": False})
+            results = [value async for value in plugin.ai_status(FakeEvent())]
+            self.assertIn("AI 分析启用：否", results[0])
+            self.assertEqual(context.llm_calls, [])
+            await plugin.terminate()
+
     async def test_direct_outbox_delivery_marks_success_and_failure(self):
         with TemporaryDirectory() as tmp:
             module = load_plugin(Path(tmp))
@@ -259,12 +307,14 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
     def test_command_contract_and_admin_permissions_are_present(self):
         source = (ROOT / "main.py").read_text(encoding="utf-8")
         for command in (
-            "skin", "search", "quote", "recommend", "items", "rule", "list", "add",
-            "set", "remove", "test", "status", "help",
+            "skin", "search", "quote", "recommend", "items", "ai", "compare", "eval",
+            "rule", "list", "add", "set", "remove", "test", "status", "help",
         ):
             self.assertIn(f'("{command}")', source)
-        self.assertGreaterEqual(source.count("PermissionType.ADMIN"), 5)
+        self.assertGreaterEqual(source.count("PermissionType.ADMIN"), 6)
         self.assertIn("event.unified_msg_origin", source)
+        self.assertIn("get_current_chat_provider_id", source)
+        self.assertIn("context.llm_generate", source)
         self.assertIn("max_price: float | None = None", source)
         self.assertIn("min_price: float | None = None", source)
         self.assertIn("min_steam_volume: int | None = None", source)

@@ -40,6 +40,7 @@ ARCHIVE_FILES = (
     "core/history_backfill.py",
     "core/integrations/__init__.py",
     "core/integrations/smis.py",
+    "core/llm_analysis.py",
     "core/manager.py",
     "core/market.py",
     "core/presentation.py",
