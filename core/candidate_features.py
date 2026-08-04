@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from typing import Any
 
@@ -52,6 +54,31 @@ def _daily_series(
             round(buff_stock[day], 2) if day in buff_stock else None for day in days
         ],
     }
+
+
+def market_observation_digest(
+    snapshot: MarketSnapshot,
+    rows: list[dict[str, Any]],
+) -> str:
+    """Identify the market facts used at issuance without storing them twice."""
+    facts = {
+        "item_key": snapshot.item_key,
+        "observed_at_utc": snapshot.observed_at.isoformat(),
+        "source_updated_at_utc": snapshot.source_updated_at.isoformat(),
+        "steam_gross_cny": snapshot.steam_sell_price,
+        "steam_net_cny": snapshot.steam_net,
+        "steam_sell_count": snapshot.steam_sell_num,
+        "steam_daily_volume": snapshot.steam_transaction_quantity,
+        "daily_series_21d": _daily_series(rows, snapshot.observed_at),
+    }
+    encoded = json.dumps(
+        facts,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def build_candidate_record(
@@ -162,9 +189,10 @@ def build_candidate_record(
             "risk_status": risk.get("status"),
         },
         "llm_contract": {
-            "role": "explain_compare_summarize",
+            "role": "analyze_observations_compare_deterministic",
             "may_override_deterministic_eligibility": False,
             "may_override_deterministic_score": False,
+            "may_challenge_deterministic_results": True,
             "must_cite_record_fields": True,
         },
     }

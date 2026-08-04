@@ -514,6 +514,8 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertNotIn("umo:a", rows[0][0])
         self.assertNotIn("umo:b", rows[0][0])
+        self.assertIn("forecast_source_digest.v1", rows[0][0])
+        self.assertNotIn("daily_series_21d", rows[0][0])
 
     def test_empty_daily_check_prevents_later_same_day_summary(self):
         manager = self.manager([0.70])

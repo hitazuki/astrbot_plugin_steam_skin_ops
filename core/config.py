@@ -27,7 +27,7 @@ class PluginSettings:
     llm_analysis_enabled: bool = False
     llm_calls_per_window: int = 3
     llm_rate_window_seconds: int = 600
-    llm_timeout_seconds: float = 60.0
+    llm_timeout_seconds: float = 130.0
     llm_max_concurrency: int = 2
 
 
@@ -143,7 +143,7 @@ def load_settings(config: Mapping[str, Any]) -> PluginSettings:
             "llm_rate_window_seconds", int, errors,
         ),
         llm_timeout_seconds=_positive(
-            config.get("llm_timeout_seconds", 60),
+            config.get("llm_timeout_seconds", 130),
             "llm_timeout_seconds", float, errors,
         ),
         llm_max_concurrency=_positive(
@@ -163,8 +163,8 @@ def load_settings(config: Mapping[str, Any]) -> PluginSettings:
         errors.append("llm_calls_per_window 不能大于 20")
     if settings.llm_max_concurrency > 8:
         errors.append("llm_max_concurrency 不能大于 8")
-    if settings.llm_timeout_seconds > 120:
-        errors.append("llm_timeout_seconds 不能大于 120")
+    if settings.llm_timeout_seconds > 180:
+        errors.append("llm_timeout_seconds 不能大于 180")
     if errors:
         raise ConfigError(errors)
     return settings

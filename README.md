@@ -19,9 +19,9 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 /skin quote <SMIS_ID|名称>                 查询全市场报价和风险
 /skin recommend [最高价] [最低价] [最低Steam日成交量]
                                             确定性综合挂刀 Top 5
-/skin ai quote <SMIS_ID|名称>                AI 解读单品确定性结果
+/skin ai quote <SMIS_ID|名称>                AI 独立观察并对照单品算法结果
 /skin ai recommend [最高价] [最低价] [最低Steam日成交量]
-                                            AI 解读确定性 Top 5
+                                            AI 双轨分析确定性 Top 5
 /skin ai compare <ID1,ID2[,ID3...]>         AI 比较 2～5 个 SMIS ID
 /skin ai eval [7|30|90|180] [all|lt100|100-999|1000+]
                                             管理员查看并解读预测评估
@@ -62,10 +62,10 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 | `recommend_max_ratio_percent` | `80` | 推荐候选最高即时挂刀比例 |
 | `recommend_min_steam_volume` | `50` | 推荐候选默认最低 Steam 日成交量；命令可临时覆盖至最低 1 |
 | `recommend_max_age_minutes` | `120` | 推荐候选最大行情年龄 |
-| `llm_analysis_enabled` | `false` | 是否开放 `/skin ai` 模型解读；确定性命令不受影响 |
+| `llm_analysis_enabled` | `false` | 是否开放 `/skin ai` 双轨分析；确定性命令不受影响 |
 | `llm_calls_per_window` | `3` | 每个会话在限流窗口内最多发起的模型调用数 |
 | `llm_rate_window_seconds` | `600` | AI 会话限流窗口 |
-| `llm_timeout_seconds` | `60` | 单次 AI Provider 调用超时 |
+| `llm_timeout_seconds` | `130` | 单次 AI Provider 调用超时，略高于 Provider 常见的 120 秒超时 |
 | `llm_max_concurrency` | `2` | 全插件并发 AI 调用上限 |
 
 配置不合法时插件不会启动后台任务，`/skin status` 会列出需要修复的字段。
@@ -93,20 +93,27 @@ https://github.com/hitazuki/astrbot_plugin_steam_skin_ops
 推荐策略标识为 `t7_risk_instant_score_v3`。每个结果同时生成符合
 [`recommendation_candidate.v1`](docs/recommendation_candidate.v1.schema.json)
 的结构化记录，保存市场观测、21 日日序列、P20/P50/P80、风险、确定性分项与扣分。
-结构供大模型解读使用，但模型只能解释和比较确定性 Top N，不能改变准入或分数。
+结构在调用时供大模型分析使用；模型可基于观察数据质疑算法，但不能改变准入或分数。
 
-## AI 只读解读
+## AI 与算法双轨分析
 
 AI 功能默认关闭。启用 `llm_analysis_enabled` 后，插件复用当前 AstrBot 会话已经选择的
 Provider，不保存 API Key，也不增加独立模型配置。`/skin ai quote`、`recommend` 和
-`compare` 会先完整展示确定性行情、预测、风险或排名，再附加模型解读；Provider
+`compare` 会先完整展示确定性行情、预测、风险或排名，再附加模型分析；Provider
 不可用、超时、限流或输出校验失败时，仅降级为确定性结果，不影响普通命令。
 
-模型收到的是 `skin_llm_analysis_request.v1` 结构化数据，不包含会话 recipient，且不
-携带聊天历史。输出必须包含“结论、主要依据、不确定性”三段，并至少引用两个真实字段
-路径。模型只能解释、比较与总结，不能改写候选准入、40/35/25 分数、P20/P50/P80、
-风险等级、规则或告警，也不会触发交易。相同 Provider 与相同输入缓存 10 分钟；调用
-记录和模型输出只保存在内存，不写入数据库。
+模型收到的是 `skin_llm_analysis_request.v2` 结构化数据，不包含会话 recipient，且不
+携带聊天历史。单品和比较任务提供最多 21 日的日级价格、成交量、库存及平台报价，
+Top 5 为控制体积提供每项最近 14 日；单品任务移除不适用的推荐准入与分数字段。模型
+必须先从可观察数据形成独立判断，再与 P20/P50/P80、风险和确定性排名对照，可以指出
+支持、冲突或算法未覆盖的信号。输出使用自然中文的“独立观察、算法对照、不确定性”
+三段，并至少引用两个
+真实字段；插件校验后将内部路径转换为“当前 Steam 到手价”“T+7 P50”等中文依据标签。
+模型遗漏引用时，插件会从本次结构化请求补入两项确定性依据；拼错或不存在的引用标记
+会被移除并用真实字段替换。
+模型可以独立分析、比较和质疑算法，但不能改写候选准入、40/35/25 分数、P20/P50/P80、风险等级、
+规则或告警，也不会触发交易。超长回复按完整句子裁剪并保留三段结构。模型输出只用于
+当前回复，不做结果缓存，也不写入数据库；限流计数只保存在内存。
 
 ## 数据来源
 
@@ -131,6 +138,9 @@ Provider，不保存 API Key，也不增加独立模型配置。`/skin ai quote`
 使用独立 schema v1 的 `forecast_evaluation.db`。两个数据库均每日在线备份。更新插件
 不会覆盖该目录；卸载插件前如需保留规则，请先备份该目录。插件不读取或迁移旧版
 独立服务的 `monitor.db`。
+
+评估库只长期保存正式预测、到期结果和来源时间/输入摘要哈希。完整候选 JSON、日级数组、
+算法中间特征、AI 请求和 AI 输出均不重复写入评估库；分析请求在运行时从现有行情事实组装。
 
 默认最多监控 20 个饰品、每 30 分钟轮询一次。纯插件版省去独立 Python/Uvicorn 容器，但行情计算与 SQLite 负载会计入 AstrBot 进程。
 

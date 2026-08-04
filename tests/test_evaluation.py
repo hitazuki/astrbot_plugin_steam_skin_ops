@@ -52,8 +52,8 @@ class ForecastEvaluationStorageTestCase(unittest.TestCase):
         return self.storage.issue(
             snapshot(when or self.issued_at),
             ready_forecast(),
-            {"schema_version": "recommendation_candidate.v1"},
             issue_date=(when or self.issued_at).date(),
+            source_digest="a" * 64,
         )
 
     def test_schema_v1_and_daily_item_dedup_do_not_store_recipient(self):
@@ -125,15 +125,17 @@ class ForecastEvaluationStorageTestCase(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ForecastEvaluationStorage(future)
 
-    def test_feature_json_round_trips(self):
+    def test_feature_json_only_keeps_compact_source_provenance(self):
         self._issue()
         with self.storage.connect() as connection:
             payload = connection.execute(
                 "SELECT feature_json FROM forecast_issuances"
             ).fetchone()[0]
-        self.assertEqual(
-            json.loads(payload)["schema_version"], "recommendation_candidate.v1"
-        )
+        record = json.loads(payload)
+        self.assertEqual(record["schema_version"], "forecast_source_digest.v1")
+        self.assertEqual(record["source_digest_sha256"], "a" * 64)
+        self.assertNotIn("derived_history", record)
+        self.assertNotIn("model_output", record)
 
     def test_summary_groups_resolved_metrics_without_schema_change(self):
         recent = datetime.now(timezone.utc) - timedelta(days=8)

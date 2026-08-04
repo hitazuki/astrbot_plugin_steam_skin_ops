@@ -55,8 +55,8 @@ class FakeContext:
         self.llm_calls.append(kwargs)
         return types.SimpleNamespace(
             completion_text=(
-                "结论：数据可供解释。【candidates.0.identity.smis_id】\n"
-                "主要依据：引用现有预测。【candidates.0.model_output.p50】\n"
+                "独立观察：数据可供分析。【candidates.0.identity.smis_id】\n"
+                "算法对照：引用现有预测。【candidates.0.model_output.p50】\n"
                 "不确定性：仍受数据质量影响。"
             )
         )
@@ -212,7 +212,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
-            self.assertIn("AI 解读", text)
+            self.assertIn("AI 双轨分析", text)
             self.assertEqual(
                 context.llm_calls[0]["chat_provider_id"],
                 f"provider:{FakeEvent.unified_msg_origin}",
@@ -315,6 +315,8 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("event.unified_msg_origin", source)
         self.assertIn("get_current_chat_provider_id", source)
         self.assertIn("context.llm_generate", source)
+        self.assertIn("request_max_retries=1", source)
+        self.assertIn("max_tokens=1600", source)
         self.assertIn("max_price: float | None = None", source)
         self.assertIn("min_price: float | None = None", source)
         self.assertIn("min_steam_volume: int | None = None", source)

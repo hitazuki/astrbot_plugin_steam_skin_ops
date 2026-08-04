@@ -124,16 +124,27 @@ class ForecastEvaluationStorage:
         self,
         snapshot: MarketSnapshot,
         forecast: dict[str, Any],
-        feature_record: dict[str, Any],
         *,
         issue_date: date,
+        source_digest: str,
     ) -> bool:
         issued_at = snapshot.observed_at.astimezone(timezone.utc)
         target_at = issued_at + timedelta(days=7)
         ready = forecast.get("status") == "ready"
         status = "pending" if ready else "unavailable"
+        # Keep schema v1 for rollback compatibility. The legacy feature columns now
+        # carry compact provenance instead of duplicated algorithm intermediates.
+        source_record = {
+            "schema_version": "forecast_source_digest.v1",
+            "source": snapshot.source,
+            "source_cutoff_at_utc": issued_at.isoformat(),
+            "source_updated_at_utc": snapshot.source_updated_at.astimezone(
+                timezone.utc
+            ).isoformat(),
+            "source_digest_sha256": str(source_digest),
+        }
         payload = json.dumps(
-            feature_record,
+            source_record,
             ensure_ascii=False,
             separators=(",", ":"),
             allow_nan=False,
@@ -167,7 +178,7 @@ class ForecastEvaluationStorage:
                 forecast.get("p80_steam_net"),
                 forecast.get("probability_up"),
                 forecast.get("interval_source"),
-                str(feature_record.get("schema_version") or "unknown"),
+                source_record["schema_version"],
                 payload,
                 datetime.now(timezone.utc).isoformat(),
             ))

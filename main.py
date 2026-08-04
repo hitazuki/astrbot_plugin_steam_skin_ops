@@ -27,8 +27,8 @@ HELP_TEXT = """Steam Skin Ops 命令：
 /skin search <名称> - 搜索 SMIS 饰品 ID
 /skin quote <SMIS_ID|名称> - 全市场即时查询
 /skin recommend [最高价] [最低价] [最低Steam日成交量] - 确定性挂刀 Top 5
-/skin ai quote <SMIS_ID|名称> - AI 解读单品确定性结果
-/skin ai recommend [最高价] [最低价] [最低Steam日成交量] - AI 解读确定性 Top 5
+/skin ai quote <SMIS_ID|名称> - AI 独立观察并对照单品算法结果
+/skin ai recommend [最高价] [最低价] [最低Steam日成交量] - AI 双轨分析确定性 Top 5
 /skin ai compare <ID1,ID2[,ID3...]> - AI 比较 2～5 个饰品
 /skin ai eval [7|30|90|180] [all|lt100|100-999|1000+] - 管理员评估摘要
 /skin ai status - 查看当前会话 AI 分析状态
@@ -121,8 +121,9 @@ class SteamSkinOpsPlugin(Star):
             chat_provider_id=provider_id,
             prompt=prompt,
             system_prompt=system_prompt,
-            max_tokens=800,
+            max_tokens=1600,
             temperature=0.2,
+            request_max_retries=1,
         )
         return str(response.completion_text or "")
 
@@ -152,8 +153,7 @@ class SteamSkinOpsPlugin(Star):
             evaluation_summary=evaluation_summary,
             generate=self._generate_analysis,
         )
-        suffix = "（缓存）" if result.cached else ""
-        return f"AI 解读{suffix}：\n{result.text}"
+        return f"AI 双轨分析：\n{result.text}"
 
     async def _with_ai_fallback(self, deterministic: str, analysis) -> str:
         try:
@@ -279,12 +279,12 @@ class SteamSkinOpsPlugin(Star):
 
     @skin.group("ai")
     def ai():
-        """只读 AI 行情解释。"""
+        """只读 AI 与确定性算法双轨分析。"""
         pass
 
     @ai.command("quote")
     async def ai_quote(self, event: AstrMessageEvent, query: str):
-        """解释单个饰品的确定性行情和风险。"""
+        """独立分析单品观察数据，再对照确定性行情和风险。"""
         try:
             data = await self._call(self._require_manager().quote, query)
             deterministic = format_quote(data)
@@ -307,7 +307,7 @@ class SteamSkinOpsPlugin(Star):
         min_price: float | None = None,
         min_steam_volume: int | None = None,
     ):
-        """解释确定性推荐 Top 5，不改变排名。"""
+        """独立分析市场结构并对照确定性 Top 5，不改变排名。"""
         try:
             data = await self._call(
                 self._require_manager().recommend,

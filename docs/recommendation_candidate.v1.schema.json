@@ -91,12 +91,13 @@
     "llm_contract": {
       "type": "object",
       "properties": {
-        "role": {"const": "explain_compare_summarize"},
+        "role": {"const": "analyze_observations_compare_deterministic"},
         "may_override_deterministic_eligibility": {"const": false},
         "may_override_deterministic_score": {"const": false},
+        "may_challenge_deterministic_results": {"const": true},
         "must_cite_record_fields": {"const": true}
       },
-      "required": ["role", "may_override_deterministic_eligibility", "may_override_deterministic_score", "must_cite_record_fields"],
+      "required": ["role", "may_override_deterministic_eligibility", "may_override_deterministic_score", "may_challenge_deterministic_results", "must_cite_record_fields"],
       "additionalProperties": false
     }
   },

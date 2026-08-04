@@ -90,9 +90,9 @@
     "default": 600
   },
   "llm_timeout_seconds": {
-    "description": "单次 AI Provider 调用超时（秒）",
+    "description": "单次 AI Provider 调用超时（秒），应略高于 Provider 自身超时",
     "type": "float",
-    "default": 60.0
+    "default": 130.0
   },
   "llm_max_concurrency": {
     "description": "插件全局 AI 分析最大并发数",

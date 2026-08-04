@@ -14,6 +14,7 @@ from .alerting import evaluate_rule_transition
 from .candidate_features import (
     RANKING_POLICY_VERSION,
     build_candidate_record,
+    market_observation_digest,
 )
 from .evaluation import ForecastEvaluationStorage
 from .history import seven_day_history_stats
@@ -1257,15 +1258,12 @@ class MonitoringManager:
                 item_key, snapshot, stats, stale=stale
             )
             rows = self.storage.market_history_rows(item_key, days=30)
-            feature_record = build_candidate_record(
-                snapshot, rows, forecast, risk
-            )
             issued += int(
                 self.evaluation_storage.issue(
                     snapshot,
                     forecast,
-                    feature_record,
                     issue_date=issue_date,
+                    source_digest=market_observation_digest(snapshot, rows),
                 )
             )
         return issued
