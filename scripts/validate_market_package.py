@@ -17,7 +17,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 
 
 ROOT = Path(__file__).parents[1]
-EXPECTED_VERSION = "1.2.0"
+EXPECTED_VERSION = "1.2.1"
 MAX_ARCHIVE_SIZE = 16 * 1024 * 1024
 ARCHIVE_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 ARCHIVE_FILE_MODE = 0o100644
