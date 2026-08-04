@@ -65,9 +65,7 @@ class PluginRuntime:
     async def _monitor_loop(self) -> None:
         while True:
             try:
-                results = await asyncio.to_thread(
-                    self.manager.run_cycle, self.max_workers
-                )
+                results = await asyncio.to_thread(self.manager.run_cycle, self.max_workers)
                 await self.dispatch()
                 self.last_cycle_ok = all(row.get("success", True) for row in results)
                 self.last_error = None
@@ -81,12 +79,8 @@ class PluginRuntime:
                         max_entries=200,
                     )
                     if self.manager.evaluation_storage is not None:
-                        await asyncio.to_thread(
-                            self.manager.evaluation_storage.prune, 180
-                        )
-                        await asyncio.to_thread(
-                            self.manager.evaluation_storage.mark_missed, now
-                        )
+                        await asyncio.to_thread(self.manager.evaluation_storage.prune, 180)
+                        await asyncio.to_thread(self.manager.evaluation_storage.mark_missed, now)
                     await asyncio.to_thread(self._backup)
                     self._last_backup_date = today
             except asyncio.CancelledError:
@@ -137,17 +131,12 @@ class PluginRuntime:
         destination = self.backup_dir / f"monitor-{datetime.now().strftime('%Y%m%d')}.db"
         self.storage.backup(destination)
         if self.manager.evaluation_storage is not None:
-            evaluation_destination = (
-                self.backup_dir
-                / f"forecast-evaluation-{datetime.now().strftime('%Y%m%d')}.db"
-            )
+            evaluation_destination = self.backup_dir / f"forecast-evaluation-{datetime.now().strftime('%Y%m%d')}.db"
             self.manager.evaluation_storage.backup(evaluation_destination)
         backups = sorted(self.backup_dir.glob("monitor-*.db"), reverse=True)
         for old in backups[retain:]:
             old.unlink(missing_ok=True)
-        evaluation_backups = sorted(
-            self.backup_dir.glob("forecast-evaluation-*.db"), reverse=True
-        )
+        evaluation_backups = sorted(self.backup_dir.glob("forecast-evaluation-*.db"), reverse=True)
         for old in evaluation_backups[retain:]:
             old.unlink(missing_ok=True)
         return destination

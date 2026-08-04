@@ -25,15 +25,27 @@ def snapshot(ratio=0.70, offset=0):
     now = datetime.now(timezone.utc) + timedelta(seconds=offset)
     steam_price = 5.34
     return MarketSnapshot(
-        item_key=ITEM["item_key"], smis_id=1579, appid=730,
-        name=ITEM["name"], name_zh=ITEM["name_zh"],
-        observed_at=now, source_updated_at=now,
+        item_key=ITEM["item_key"],
+        smis_id=1579,
+        appid=730,
+        name=ITEM["name"],
+        name_zh=ITEM["name_zh"],
+        observed_at=now,
+        source_updated_at=now,
         buff_sell_price=round(steam_net_amount(steam_price) * ratio, 2),
-        buff_sell_num=0, uuyp_sell_price=0, uuyp_sell_num=0,
-        c5_sell_price=0, c5_sell_num=0, igxe_sell_price=0, igxe_sell_num=0,
-        eco_sell_price=0, eco_sell_num=0,
-        steam_sell_price=steam_price, steam_sell_num=0,
-        steam_transaction_quantity=0, buff_to_steam_ratio=ratio,
+        buff_sell_num=0,
+        uuyp_sell_price=0,
+        uuyp_sell_num=0,
+        c5_sell_price=0,
+        c5_sell_num=0,
+        igxe_sell_price=0,
+        igxe_sell_num=0,
+        eco_sell_price=0,
+        eco_sell_num=0,
+        steam_sell_price=steam_price,
+        steam_sell_num=0,
+        steam_transaction_quantity=0,
+        buff_to_steam_ratio=ratio,
     )
 
 
@@ -85,19 +97,23 @@ class ForecastHistorySource(FakeSource):
 class StaleSource(FakeSource):
     def fetch_current(self, item):
         value = super().fetch_current(item)
-        return MarketSnapshot(**{
-            **value.__dict__,
-            "source_updated_at": datetime.now(timezone.utc) - timedelta(minutes=30),
-        })
+        return MarketSnapshot(
+            **{
+                **value.__dict__,
+                "source_updated_at": datetime.now(timezone.utc) - timedelta(minutes=30),
+            }
+        )
 
 
 class FutureSource(FakeSource):
     def fetch_current(self, item):
         value = super().fetch_current(item)
-        return MarketSnapshot(**{
-            **value.__dict__,
-            "source_updated_at": datetime.now(timezone.utc) + timedelta(days=2),
-        })
+        return MarketSnapshot(
+            **{
+                **value.__dict__,
+                "source_updated_at": datetime.now(timezone.utc) + timedelta(days=2),
+            }
+        )
 
 
 class ServiceTestCase(unittest.TestCase):
@@ -111,7 +127,8 @@ class ServiceTestCase(unittest.TestCase):
 
     def manager(self, ratios=None, cache=60):
         return MonitoringManager(
-            self.storage, FakeSource(ratios),
+            self.storage,
+            FakeSource(ratios),
             quote_cache_seconds=cache,
         )
 
@@ -187,9 +204,7 @@ class ServiceTestCase(unittest.TestCase):
         event = migrated.list_events("recipient:a", acknowledged=None)[0]
         self.assertEqual(event["delivery_status"], "sent")
         with migrated.connect() as connection:
-            version = connection.execute(
-                "SELECT value FROM metadata WHERE key='schema_version'"
-            ).fetchone()[0]
+            version = connection.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0]
         self.assertEqual(version, str(SCHEMA_VERSION))
 
         reopened = MonitorStorage(legacy_path)
@@ -200,9 +215,7 @@ class ServiceTestCase(unittest.TestCase):
         path = Path(self.tmp.name) / "future.db"
         storage = MonitorStorage(path)
         with storage.connect() as connection:
-            connection.execute(
-                "UPDATE metadata SET value='99' WHERE key='schema_version'"
-            )
+            connection.execute("UPDATE metadata SET value='99' WHERE key='schema_version'")
 
         with self.assertRaisesRegex(RuntimeError, "newer than supported"):
             MonitorStorage(path)
@@ -215,30 +228,23 @@ class ServiceTestCase(unittest.TestCase):
         storage.update_rule_state(rule["id"], alert_active=1, last_value=0.67)
         with storage.connect() as connection:
             connection.execute("ALTER TABLE rule_states DROP COLUMN highest_notified_level")
-            connection.execute(
-                "UPDATE metadata SET value='3' WHERE key='schema_version'"
-            )
+            connection.execute("UPDATE metadata SET value='3' WHERE key='schema_version'")
 
         migrated = MonitorStorage(path)
         state = migrated.get_rule_state(rule["id"])
         self.assertEqual(state["highest_notified_level"], 2)
         MonitoringManager(
-            migrated, FakeSource([0.67]),
+            migrated,
+            FakeSource([0.67]),
             breakthrough_step_percent=1,
         )
-        self.assertEqual(
-            migrated.get_rule_state(rule["id"])["highest_notified_level"], 6
-        )
+        self.assertEqual(migrated.get_rule_state(rule["id"])["highest_notified_level"], 6)
 
     def test_t7_forecast_basis_upgrade_resets_only_t7_rule_state(self):
         t7_rule = self.storage.add_rule(1579, "umo:a", "t7", 72)
         ratio_rule = self.storage.add_rule(1579, "umo:a", "ratio", 72)
-        self.storage.update_rule_state(
-            t7_rule["id"], alert_active=1, last_value=0.70, status="active"
-        )
-        self.storage.update_rule_state(
-            ratio_rule["id"], alert_active=1, last_value=0.70, status="active"
-        )
+        self.storage.update_rule_state(t7_rule["id"], alert_active=1, last_value=0.70, status="active")
+        self.storage.update_rule_state(ratio_rule["id"], alert_active=1, last_value=0.70, status="active")
 
         MonitoringManager(self.storage, FakeSource())
 
@@ -246,12 +252,8 @@ class ServiceTestCase(unittest.TestCase):
             self.storage.get_metadata("alerting:t7_basis"),
             "seven_day_probabilistic:v2",
         )
-        self.assertEqual(
-            self.storage.get_rule_state(t7_rule["id"])["alert_active"], 0
-        )
-        self.assertEqual(
-            self.storage.get_rule_state(ratio_rule["id"])["alert_active"], 1
-        )
+        self.assertEqual(self.storage.get_rule_state(t7_rule["id"])["alert_active"], 0)
+        self.assertEqual(self.storage.get_rule_state(ratio_rule["id"])["alert_active"], 1)
 
     def test_quote_uses_sixty_second_cache(self):
         manager = self.manager([0.70])
@@ -287,14 +289,21 @@ class ServiceTestCase(unittest.TestCase):
     def test_quote_returns_all_available_platforms_and_marks_every_lowest(self):
         manager = self.manager()
         current = snapshot()
-        manager.source.fetch_current = lambda item: MarketSnapshot(**{
-            **current.__dict__,
-            "buff_sell_price": 3.30, "buff_sell_num": 100,
-            "uuyp_sell_price": 3.20, "uuyp_sell_num": 80,
-            "c5_sell_price": 3.10, "c5_sell_num": 60,
-            "igxe_sell_price": 3.40, "igxe_sell_num": 40,
-            "eco_sell_price": 3.10, "eco_sell_num": 20,
-        })
+        manager.source.fetch_current = lambda item: MarketSnapshot(
+            **{
+                **current.__dict__,
+                "buff_sell_price": 3.30,
+                "buff_sell_num": 100,
+                "uuyp_sell_price": 3.20,
+                "uuyp_sell_num": 80,
+                "c5_sell_price": 3.10,
+                "c5_sell_num": 60,
+                "igxe_sell_price": 3.40,
+                "igxe_sell_num": 40,
+                "eco_sell_price": 3.10,
+                "eco_sell_num": 20,
+            }
+        )
 
         result = manager.quote("1579")
 
@@ -309,19 +318,28 @@ class ServiceTestCase(unittest.TestCase):
 
     def test_search_uses_smis_catalog(self):
         results = self.manager().search_items("裂空", limit=5)
-        self.assertEqual(results, [{
-            "smis_id": 1579, "name_zh": "裂空武器箱", "rarity": "普通级",
-        }])
+        self.assertEqual(
+            results,
+            [
+                {
+                    "smis_id": 1579,
+                    "name_zh": "裂空武器箱",
+                    "rarity": "普通级",
+                }
+            ],
+        )
 
     def test_item_listing_is_scoped_to_current_recipient(self):
         manager = self.manager()
-        self.storage.upsert_item({
-            "smis_id": 2000,
-            "item_key": "smis:2000",
-            "appid": 730,
-            "name": "Other Item",
-            "name_zh": "其他饰品",
-        })
+        self.storage.upsert_item(
+            {
+                "smis_id": 2000,
+                "item_key": "smis:2000",
+                "appid": 730,
+                "name": "Other Item",
+                "name_zh": "其他饰品",
+            }
+        )
         self.storage.add_rule(1579, "umo:a", "ratio", 72)
         self.storage.add_rule(2000, "umo:b", "ratio", 72)
 
@@ -397,9 +415,7 @@ class ServiceTestCase(unittest.TestCase):
         self.assertNotIn("第", titles[0])
         self.assertIn("第 2 档", titles[1])
         self.assertIn("第 2 档", titles[2])
-        self.assertEqual(
-            self.storage.get_rule_state(rule["id"])["highest_notified_level"], 2
-        )
+        self.assertEqual(self.storage.get_rule_state(rule["id"])["highest_notified_level"], 2)
 
     def test_breakthrough_level_includes_exact_three_percent_boundary(self):
         cases = (
@@ -418,13 +434,17 @@ class ServiceTestCase(unittest.TestCase):
 
     def test_ready_analysis_message_separates_forecast_and_risk_ratios(self):
         forecast = {
-            "status": "ready", "predicted_steam_net": 4.42,
-            "change_pct": -5.4, "forecast_balance_ratio": 0.7217,
-            "window_days": 21, "mode_label": "稳健对数趋势",
+            "status": "ready",
+            "predicted_steam_net": 4.42,
+            "change_pct": -5.4,
+            "forecast_balance_ratio": 0.7217,
+            "window_days": 21,
+            "mode_label": "稳健对数趋势",
             "confidence": "normal",
         }
         risk = {
-            "status": "ready", "overall_level": "high",
+            "status": "ready",
+            "overall_level": "high",
             "confidence": "normal",
             "risk_balance_ratio": 0.7384,
             "dimensions": {
@@ -445,23 +465,29 @@ class ServiceTestCase(unittest.TestCase):
 
     def test_analysis_message_deduplicates_risk_ratio_by_floor_source(self):
         forecast = {
-            "status": "ready", "predicted_steam_net": 4.42,
-            "change_pct": -5.4, "forecast_balance_ratio": 0.7217,
-            "window_days": 21, "mode_label": "稳健对数趋势",
+            "status": "ready",
+            "predicted_steam_net": 4.42,
+            "change_pct": -5.4,
+            "forecast_balance_ratio": 0.7217,
+            "window_days": 21,
+            "mode_label": "稳健对数趋势",
             "confidence": "normal",
         }
         risk = {
-            "status": "ready", "overall_level": "high", "confidence": "normal",
-            "risk_steam_net": 4.67, "risk_balance_ratio": 0.6831,
-            "dimensions": {
-                key: {"level": "low"}
-                for key in ("price", "volatility", "inventory", "volume")
-            },
+            "status": "ready",
+            "overall_level": "high",
+            "confidence": "normal",
+            "risk_steam_net": 4.67,
+            "risk_balance_ratio": 0.6831,
+            "dimensions": {key: {"level": "low"} for key in ("price", "volatility", "inventory", "volume")},
             "reasons": [],
         }
 
         current_lines = analysis_reference_lines(
-            forecast, risk, current_steam_net=4.67, t7_steam_net_p25=4.60,
+            forecast,
+            risk,
+            current_steam_net=4.67,
+            t7_steam_net_p25=4.60,
         )
         self.assertIn(
             "风险倒余额比例：同即时比例（当前到手价为风险底价）",
@@ -470,7 +496,10 @@ class ServiceTestCase(unittest.TestCase):
 
         risk.update({"risk_steam_net": 4.42, "risk_balance_ratio": 0.7217})
         forecast_lines = analysis_reference_lines(
-            forecast, risk, current_steam_net=4.67, t7_steam_net_p25=4.60,
+            forecast,
+            risk,
+            current_steam_net=4.67,
+            t7_steam_net_p25=4.60,
         )
         self.assertIn(
             "风险倒余额比例：同预测比例（七日预测价为风险底价）",
@@ -493,9 +522,7 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(len(self.stored_messages("daily_summary")), 1)
 
     def test_daily_forecast_is_shared_across_recipients_and_rules(self):
-        evaluation = ForecastEvaluationStorage(
-            Path(self.tmp.name) / "forecast_evaluation.db"
-        )
+        evaluation = ForecastEvaluationStorage(Path(self.tmp.name) / "forecast_evaluation.db")
         manager = MonitoringManager(
             self.storage,
             ForecastHistorySource([0.70]),
@@ -507,9 +534,7 @@ class ServiceTestCase(unittest.TestCase):
 
         manager.enqueue_daily_summary(date(2026, 7, 25))
         with evaluation.connect() as connection:
-            rows = connection.execute(
-                "SELECT feature_json FROM forecast_issuances"
-            ).fetchall()
+            rows = connection.execute("SELECT feature_json FROM forecast_issuances").fetchall()
 
         self.assertEqual(len(rows), 1)
         self.assertNotIn("umo:a", rows[0][0])
@@ -535,11 +560,7 @@ class ServiceTestCase(unittest.TestCase):
         with self.storage.connect() as connection:
             connection.execute(
                 "UPDATE market_snapshots SET source_updated_at=? WHERE kind='current'",
-                (
-                    (
-                        datetime.now(timezone.utc) - timedelta(hours=1)
-                    ).isoformat(),
-                ),
+                ((datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),),
             )
 
         self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 26)), 0)
@@ -550,10 +571,7 @@ class ServiceTestCase(unittest.TestCase):
         self.storage.add_rule(1579, "umo:a", "ratio", 72)
         manager.run_cycle(max_workers=1)
         with self.storage.connect() as connection:
-            connection.execute(
-                "UPDATE market_snapshots SET source_updated_at='broken' "
-                "WHERE kind='current'"
-            )
+            connection.execute("UPDATE market_snapshots SET source_updated_at='broken' WHERE kind='current'")
 
         items = manager.list_items("umo:a")
         queued = manager.enqueue_daily_summary(date(2026, 7, 27))
@@ -567,22 +585,24 @@ class ServiceTestCase(unittest.TestCase):
         manager = self.manager()
         recovery = self.storage.add_rule(1579, "umo:a", "ratio", 72)
         missing = self.storage.add_rule(1579, "umo:a", "platform", 3.40)
-        self.storage.update_rule_state(
-            recovery["id"], alert_active=1, last_value=0.73
-        )
-        self.storage.update_rule_state(
-            missing["id"], alert_active=1, last_value=None
-        )
+        self.storage.update_rule_state(recovery["id"], alert_active=1, last_value=0.73)
+        self.storage.update_rule_state(missing["id"], alert_active=1, last_value=None)
 
         self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
 
     def test_lowest_platform_ignores_liquidity(self):
         value = snapshot()
-        value = MarketSnapshot(**{
-            **value.__dict__, "buff_sell_price": 3.30, "buff_sell_num": 1000,
-            "c5_sell_price": 3.10, "c5_sell_num": 0,
-            "uuyp_sell_price": 3.20, "uuyp_sell_num": 1,
-        })
+        value = MarketSnapshot(
+            **{
+                **value.__dict__,
+                "buff_sell_price": 3.30,
+                "buff_sell_num": 1000,
+                "c5_sell_price": 3.10,
+                "c5_sell_num": 0,
+                "uuyp_sell_price": 3.20,
+                "uuyp_sell_num": 1,
+            }
+        )
         self.assertEqual(value.lowest_platform, ("C5", 3.10, 0))
         self.assertEqual(value.calculated_ratio, round(3.10 / value.steam_net, 4))
 
@@ -594,12 +614,8 @@ class ServiceTestCase(unittest.TestCase):
         quote = manager.quote("1579")
 
         self.assertEqual(quote["forecast"]["status"], "ready")
-        self.assertEqual(
-            state["last_value"], quote["forecast"]["forecast_balance_ratio"]
-        )
-        self.assertEqual(
-            state["last_baseline"], quote["forecast"]["predicted_steam_net"]
-        )
+        self.assertEqual(state["last_value"], quote["forecast"]["forecast_balance_ratio"])
+        self.assertEqual(state["last_baseline"], quote["forecast"]["predicted_steam_net"])
         self.assertEqual(state["alert_active"], 1)
         messages = self.stored_messages()
         self.assertEqual(len(messages), 1)
@@ -623,11 +639,15 @@ class ServiceTestCase(unittest.TestCase):
         for index in range(1, 30 * 12 + 1):
             observed = now - timedelta(hours=index * 2)
             value = snapshot(0.70)
-            stale_rows.append(MarketSnapshot(**{
-                **value.__dict__,
-                "observed_at": observed,
-                "source_updated_at": observed - timedelta(hours=2),
-            }))
+            stale_rows.append(
+                MarketSnapshot(
+                    **{
+                        **value.__dict__,
+                        "observed_at": observed,
+                        "source_updated_at": observed - timedelta(hours=2),
+                    }
+                )
+            )
         self.storage.save_snapshots(stale_rows)
         manager = self.manager([0.70])
         rule = self.storage.add_rule(1579, "umo:a", "t7", 100)
@@ -647,9 +667,13 @@ class ServiceTestCase(unittest.TestCase):
         self.storage.add_rule(1579, "umo:a", "steam", 5.30)
         manager.run_cycle(max_workers=1)
         manager.run_cycle(max_workers=1)
-        self.assertEqual({message[1].split("】", 1)[0] + "】" for message in self.stored_messages()}, {
-            "【平台到价】", "【Steam清仓】",
-        })
+        self.assertEqual(
+            {message[1].split("】", 1)[0] + "】" for message in self.stored_messages()},
+            {
+                "【平台到价】",
+                "【Steam清仓】",
+            },
+        )
 
     def test_stale_source_time_skips_trade_alert_without_health_failure(self):
         manager = MonitoringManager(self.storage, StaleSource([0.70]))
@@ -689,19 +713,13 @@ class ServiceTestCase(unittest.TestCase):
             max_current_lag_seconds=manager.poll_interval_seconds,
         )
         future_limit = datetime.now(timezone.utc) + timedelta(minutes=5)
-        self.assertTrue(all(
-            datetime.fromisoformat(row["source_updated_at"]) <= future_limit
-            for row in history
-        ))
+        self.assertTrue(all(datetime.fromisoformat(row["source_updated_at"]) <= future_limit for row in history))
 
     def test_corrupt_cached_timestamp_falls_through_to_upstream(self):
         manager = self.manager([0.70])
         self.storage.save_snapshots([snapshot(0.71)])
         with self.storage.connect() as connection:
-            connection.execute(
-                "UPDATE market_snapshots SET source_updated_at='broken' "
-                "WHERE kind='current'"
-            )
+            connection.execute("UPDATE market_snapshots SET source_updated_at='broken' WHERE kind='current'")
 
         quote = manager.quote("1579")
         cached = manager.quote("1579")
@@ -727,9 +745,7 @@ class ServiceTestCase(unittest.TestCase):
 
         self.assertEqual(self.storage.prune_snapshots(retain_days=8), 1)
         with self.storage.connect() as connection:
-            remaining = connection.execute(
-                "SELECT COUNT(*) FROM market_snapshots"
-            ).fetchone()[0]
+            remaining = connection.execute("SELECT COUNT(*) FROM market_snapshots").fetchone()[0]
         self.assertEqual(remaining, 1)
 
     def test_history_backfill_only_runs_when_local_coverage_is_insufficient(self):
@@ -744,9 +760,7 @@ class ServiceTestCase(unittest.TestCase):
     def test_sparse_cache_and_legacy_done_marker_still_retry_upstream(self):
         manager = self.manager()
         old = snapshot(0.70, -(30 * 86400))
-        self.storage.save_snapshots([
-            MarketSnapshot(**{**old.__dict__, "kind": "history"})
-        ])
+        self.storage.save_snapshots([MarketSnapshot(**{**old.__dict__, "kind": "history"})])
         key = f"history-bootstrap:{ITEM['item_key']}:30"
         self.storage.set_metadata(key, "done")
 
@@ -760,19 +774,19 @@ class ServiceTestCase(unittest.TestCase):
     def test_unchanged_market_after_observation_gap_does_not_backfill(self):
         manager = self.manager()
         old = snapshot(0.70, -(4 * 3600))
-        current = MarketSnapshot(**{
-            **old.__dict__,
-            "observed_at": datetime.now(timezone.utc),
-        })
+        current = MarketSnapshot(
+            **{
+                **old.__dict__,
+                "observed_at": datetime.now(timezone.utc),
+            }
+        )
         previous = {
             **old.__dict__,
             "observed_at": old.observed_at.isoformat(),
             "source_updated_at": old.source_updated_at.isoformat(),
         }
 
-        manager.history_backfiller.backfill_changed_gap(
-            dict(ITEM), previous, current, []
-        )
+        manager.history_backfiller.backfill_changed_gap(dict(ITEM), previous, current, [])
 
         self.assertEqual(manager.source.history_calls, 0)
 
@@ -787,13 +801,13 @@ class ServiceTestCase(unittest.TestCase):
                 "observed_at": (now - timedelta(hours=hours)).isoformat(),
                 "source_updated_at": old.source_updated_at.isoformat(),
             }
-            current = MarketSnapshot(**{
-                **current.__dict__,
-                "observed_at": now,
-            })
-            manager.history_backfiller.backfill_changed_gap(
-                dict(ITEM), previous, current, []
+            current = MarketSnapshot(
+                **{
+                    **current.__dict__,
+                    "observed_at": now,
+                }
             )
+            manager.history_backfiller.backfill_changed_gap(dict(ITEM), previous, current, [])
             self.assertEqual(manager.source.history_days[-1], expected_days)
 
         self.assertEqual(manager.source.history_days, [1, 2])
@@ -816,29 +830,23 @@ class ServiceTestCase(unittest.TestCase):
             "observed_at": (now - timedelta(hours=25)).isoformat(),
             "source_updated_at": old.source_updated_at.isoformat(),
         }
-        current = MarketSnapshot(**{
-            **snapshot(0.75).__dict__,
-            "observed_at": now,
-        })
+        current = MarketSnapshot(
+            **{
+                **snapshot(0.75).__dict__,
+                "observed_at": now,
+            }
+        )
 
         with self.assertRaisesRegex(RuntimeError, "temporary"):
-            manager.history_backfiller.backfill_changed_gap(
-                dict(ITEM), previous, current, []
-            )
-        manager.history_backfiller.backfill_changed_gap(
-            dict(ITEM), previous, current, []
-        )
+            manager.history_backfiller.backfill_changed_gap(dict(ITEM), previous, current, [])
+        manager.history_backfiller.backfill_changed_gap(dict(ITEM), previous, current, [])
         self.assertEqual(source.history_calls, 1)
 
         pending_key = f"history-gap-pending:{ITEM['item_key']}"
         pending = json.loads(self.storage.get_metadata(pending_key))
-        pending["attempted_at"] = (
-            datetime.now(timezone.utc) - timedelta(hours=6, minutes=1)
-        ).isoformat()
+        pending["attempted_at"] = (datetime.now(timezone.utc) - timedelta(hours=6, minutes=1)).isoformat()
         self.storage.set_metadata(pending_key, json.dumps(pending))
-        manager.history_backfiller.backfill_changed_gap(
-            dict(ITEM), previous, current, []
-        )
+        manager.history_backfiller.backfill_changed_gap(dict(ITEM), previous, current, [])
 
         self.assertEqual(source.history_days, [2, 2])
         self.assertEqual(self.storage.get_metadata(pending_key), "")
@@ -846,10 +854,12 @@ class ServiceTestCase(unittest.TestCase):
     def test_pruning_uses_successful_observation_time_for_cold_items(self):
         old_source = datetime.now(timezone.utc) - timedelta(days=40)
         current = snapshot(0.70)
-        current = MarketSnapshot(**{
-            **current.__dict__,
-            "source_updated_at": old_source,
-        })
+        current = MarketSnapshot(
+            **{
+                **current.__dict__,
+                "source_updated_at": old_source,
+            }
+        )
         self.storage.save_snapshots([current])
 
         self.assertEqual(self.storage.prune_snapshots(retain_days=30), 0)
@@ -859,9 +869,7 @@ class ServiceTestCase(unittest.TestCase):
         manager = self.manager()
         first = manager.add_rule("umo:a", 1579, "steam", 5.50)
         self.assertEqual(first["action"], "created")
-        self.storage.update_rule_state(
-            first["id"], alert_active=1, qualifying_count=2, status="active"
-        )
+        self.storage.update_rule_state(first["id"], alert_active=1, qualifying_count=2, status="active")
 
         second = manager.add_rule("umo:a", 1579, "steam", 5.40)
 
@@ -869,27 +877,25 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(second["action"], "updated")
         self.assertEqual(second["previous_threshold"], 5.50)
         self.assertEqual(second["threshold"], 5.40)
-        self.assertEqual(
-            len(self.storage.list_rules(recipient_key="umo:a", smis_id=1579)), 1
-        )
+        self.assertEqual(len(self.storage.list_rules(recipient_key="umo:a", smis_id=1579)), 1)
         self.assertEqual(self.storage.get_rule_state(first["id"])["alert_active"], 0)
 
         unchanged = manager.add_rule("umo:a", 1579, "steam", 5.40)
         self.assertEqual(unchanged["id"], first["id"])
         self.assertEqual(unchanged["action"], "unchanged")
-        self.assertEqual(
-            len(self.storage.list_rules(recipient_key="umo:a", smis_id=1579)), 1
-        )
+        self.assertEqual(len(self.storage.list_rules(recipient_key="umo:a", smis_id=1579)), 1)
 
     def test_item_limit_is_enforced_before_source_request(self):
         for smis_id in range(1, 21):
-            self.storage.upsert_item({
-                "smis_id": smis_id,
-                "item_key": f"smis:{smis_id}",
-                "appid": 730,
-                "name": f"Item {smis_id}",
-                "name_zh": f"饰品 {smis_id}",
-            })
+            self.storage.upsert_item(
+                {
+                    "smis_id": smis_id,
+                    "item_key": f"smis:{smis_id}",
+                    "appid": 730,
+                    "name": f"Item {smis_id}",
+                    "name_zh": f"饰品 {smis_id}",
+                }
+            )
             self.storage.add_rule(smis_id, "umo:test", "ratio", 72)
         manager = self.manager()
         with self.assertRaisesRegex(Exception, "最多只能监控 20 个饰品"):

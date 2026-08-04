@@ -71,16 +71,10 @@ def load_settings(config: Mapping[str, Any]) -> PluginSettings:
 
     settings = PluginSettings(
         enabled=enabled,
-        interval_seconds=_positive(
-            config.get("interval_seconds", 1800), "interval_seconds", int, errors
-        ),
-        quote_cache_seconds=_positive(
-            config.get("quote_cache_seconds", 60), "quote_cache_seconds", int, errors
-        ),
+        interval_seconds=_positive(config.get("interval_seconds", 1800), "interval_seconds", int, errors),
+        quote_cache_seconds=_positive(config.get("quote_cache_seconds", 60), "quote_cache_seconds", int, errors),
         max_items=_positive(config.get("max_items", 20), "max_items", int, errors),
-        max_workers=_positive(
-            config.get("max_workers", 2), "max_workers", int, errors
-        ),
+        max_workers=_positive(config.get("max_workers", 2), "max_workers", int, errors),
         breakthrough_step_percent=_positive(
             config.get("breakthrough_step_percent", 3),
             "breakthrough_step_percent",
@@ -94,9 +88,7 @@ def load_settings(config: Mapping[str, Any]) -> PluginSettings:
             float,
             errors,
         ),
-        smis_max_retries=_positive(
-            config.get("smis_max_retries", 3), "smis_max_retries", int, errors
-        ),
+        smis_max_retries=_positive(config.get("smis_max_retries", 3), "smis_max_retries", int, errors),
         smis_min_request_interval_seconds=_positive(
             config.get("smis_min_request_interval_seconds", 1),
             "smis_min_request_interval_seconds",
@@ -136,19 +128,27 @@ def load_settings(config: Mapping[str, Any]) -> PluginSettings:
         llm_analysis_enabled=llm_analysis_enabled,
         llm_calls_per_window=_positive(
             config.get("llm_calls_per_window", 3),
-            "llm_calls_per_window", int, errors,
+            "llm_calls_per_window",
+            int,
+            errors,
         ),
         llm_rate_window_seconds=_positive(
             config.get("llm_rate_window_seconds", 600),
-            "llm_rate_window_seconds", int, errors,
+            "llm_rate_window_seconds",
+            int,
+            errors,
         ),
         llm_timeout_seconds=_positive(
             config.get("llm_timeout_seconds", 130),
-            "llm_timeout_seconds", float, errors,
+            "llm_timeout_seconds",
+            float,
+            errors,
         ),
         llm_max_concurrency=_positive(
             config.get("llm_max_concurrency", 2),
-            "llm_max_concurrency", int, errors,
+            "llm_max_concurrency",
+            int,
+            errors,
         ),
     )
     if settings.max_workers > 8:

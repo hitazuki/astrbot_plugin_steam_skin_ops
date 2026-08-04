@@ -26,16 +26,27 @@ def make_snapshot(
     kind: str = "current",
 ) -> MarketSnapshot:
     return MarketSnapshot(
-        item_key="smis:61753", smis_id=61753, appid=730,
-        name="Test Item", name_zh="测试饰品",
-        observed_at=when, source_updated_at=when,
-        buff_sell_price=buff_price, buff_sell_num=buff_count,
-        uuyp_sell_price=0, uuyp_sell_num=0,
-        c5_sell_price=0, c5_sell_num=0,
-        igxe_sell_price=0, igxe_sell_num=0,
-        eco_sell_price=0, eco_sell_num=0,
-        steam_sell_price=steam_price, steam_sell_num=steam_count,
-        steam_transaction_quantity=volume, kind=kind,
+        item_key="smis:61753",
+        smis_id=61753,
+        appid=730,
+        name="Test Item",
+        name_zh="测试饰品",
+        observed_at=when,
+        source_updated_at=when,
+        buff_sell_price=buff_price,
+        buff_sell_num=buff_count,
+        uuyp_sell_price=0,
+        uuyp_sell_num=0,
+        c5_sell_price=0,
+        c5_sell_num=0,
+        igxe_sell_price=0,
+        igxe_sell_num=0,
+        eco_sell_price=0,
+        eco_sell_num=0,
+        steam_sell_price=steam_price,
+        steam_sell_num=steam_count,
+        steam_transaction_quantity=volume,
+        kind=kind,
     )
 
 
@@ -48,7 +59,9 @@ def as_row(snapshot: MarketSnapshot) -> dict:
 
 
 def series_rows(
-    prices: list[float], *, volumes: list[int] | None = None,
+    prices: list[float],
+    *,
+    volumes: list[int] | None = None,
     steam_counts: list[int] | None = None,
     buff_counts: list[int] | None = None,
 ) -> list[dict]:
@@ -58,12 +71,17 @@ def series_rows(
         day = NOW - timedelta(days=days - day_index - 1)
         for bucket in range(12):
             when = day.replace(hour=bucket * 2)
-            rows.append(as_row(make_snapshot(
-                when, price,
-                volume=(volumes or [100] * days)[day_index],
-                steam_count=(steam_counts or [100] * days)[day_index],
-                buff_count=(buff_counts or [100] * days)[day_index],
-            )))
+            rows.append(
+                as_row(
+                    make_snapshot(
+                        when,
+                        price,
+                        volume=(volumes or [100] * days)[day_index],
+                        steam_count=(steam_counts or [100] * days)[day_index],
+                        buff_count=(buff_counts or [100] * days)[day_index],
+                    )
+                )
+            )
     return rows
 
 
@@ -79,7 +97,8 @@ class ForecastSelectionTestCase(unittest.TestCase):
         self.assertIn(forecast["mode"], {"persistence", "recent_level"})
         self.assertAlmostEqual(
             forecast["forecast_balance_ratio"],
-            7.0 / forecast["predicted_steam_net"], places=4,
+            7.0 / forecast["predicted_steam_net"],
+            places=4,
         )
 
     def test_linear_data_selects_linear_fit(self):
@@ -120,9 +139,7 @@ class ForecastSelectionTestCase(unittest.TestCase):
         current = make_snapshot(NOW, 10.65)
 
         low, _, _ = forecast_seven_days(low_rows, current, now=NOW)
-        unavailable, _, _ = forecast_seven_days(
-            insufficient_rows, current, now=NOW
-        )
+        unavailable, _, _ = forecast_seven_days(insufficient_rows, current, now=NOW)
 
         self.assertEqual(low["status"], "ready")
         self.assertEqual(low["confidence"], "low")
@@ -141,25 +158,17 @@ class ForecastSelectionTestCase(unittest.TestCase):
         history = make_snapshot(NOW - timedelta(minutes=20), 12.0, kind="history")
         current = make_snapshot(NOW - timedelta(minutes=10), 10.0)
 
-        rows = canonical_two_hour_rows(
-            [as_row(history), as_row(current)], now=NOW
-        )
+        rows = canonical_two_hour_rows([as_row(history), as_row(current)], now=NOW)
 
         self.assertEqual(len(rows), 2)
         self.assertEqual([row["kind"] for row in rows], ["history", "current"])
 
     def test_probabilistic_fields_are_ordered_and_directional(self):
         prices = [20.0 + index * 0.25 for index in range(30)]
-        forecast, _, _ = forecast_seven_days(
-            series_rows(prices), make_snapshot(NOW, prices[-1]), now=NOW
-        )
+        forecast, _, _ = forecast_seven_days(series_rows(prices), make_snapshot(NOW, prices[-1]), now=NOW)
 
-        self.assertLessEqual(
-            forecast["p20_steam_net"], forecast["predicted_steam_net"]
-        )
-        self.assertLessEqual(
-            forecast["predicted_steam_net"], forecast["p80_steam_net"]
-        )
+        self.assertLessEqual(forecast["p20_steam_net"], forecast["predicted_steam_net"])
+        self.assertLessEqual(forecast["predicted_steam_net"], forecast["p80_steam_net"])
         self.assertEqual(forecast["trend_regime"], "up")
         self.assertGreaterEqual(forecast["exact_t7_validation_count"], 4)
         self.assertGreater(forecast["probability_up"], 0.5)
@@ -185,18 +194,14 @@ class ForecastSelectionTestCase(unittest.TestCase):
             when = old_now - timedelta(days=20 - index)
             rows.append(as_row(make_snapshot(when, 10.0)))
 
-        forecast, _, _ = forecast_seven_days(
-            rows, make_snapshot(NOW, 10.0), now=NOW
-        )
+        forecast, _, _ = forecast_seven_days(rows, make_snapshot(NOW, 10.0), now=NOW)
 
         self.assertEqual(forecast["status"], "stale_history")
 
     def test_stale_current_observations_do_not_fill_forecast_coverage(self):
         rows = series_rows([10.0] * 30)
         for row in rows:
-            row["source_updated_at"] = (
-                datetime.fromisoformat(row["observed_at"]) - timedelta(hours=2)
-            ).isoformat()
+            row["source_updated_at"] = (datetime.fromisoformat(row["observed_at"]) - timedelta(hours=2)).isoformat()
         current = make_snapshot(NOW, 10.0)
 
         forecast, grid, _ = forecast_seven_days(
@@ -211,49 +216,62 @@ class ForecastSelectionTestCase(unittest.TestCase):
 
     def test_dense_fresh_history_is_usable_but_future_source_times_are_not(self):
         fresh = series_rows([10.0] * 30)
-        self.assertTrue(has_usable_history_coverage(
-            fresh,
-            now=NOW,
-            max_current_lag_seconds=1800,
-        ))
+        self.assertTrue(
+            has_usable_history_coverage(
+                fresh,
+                now=NOW,
+                max_current_lag_seconds=1800,
+            )
+        )
         for row in fresh:
-            row["source_updated_at"] = (
-                datetime.fromisoformat(row["observed_at"]) + timedelta(days=2)
-            ).isoformat()
+            row["source_updated_at"] = (datetime.fromisoformat(row["observed_at"]) + timedelta(days=2)).isoformat()
 
-        self.assertFalse(has_usable_history_coverage(
-            fresh,
-            now=NOW,
-            max_current_lag_seconds=1800,
-        ))
+        self.assertFalse(
+            has_usable_history_coverage(
+                fresh,
+                now=NOW,
+                max_current_lag_seconds=1800,
+            )
+        )
 
 
 class RiskDimensionTestCase(unittest.TestCase):
     def _assessment(
-        self, prices: list[float], *, volumes: list[int] | None = None,
+        self,
+        prices: list[float],
+        *,
+        volumes: list[int] | None = None,
         steam_counts: list[int] | None = None,
         buff_counts: list[int] | None = None,
         forecast_change: float = 0.0,
     ) -> dict:
         rows = series_rows(
-            prices, volumes=volumes,
-            steam_counts=steam_counts, buff_counts=buff_counts,
+            prices,
+            volumes=volumes,
+            steam_counts=steam_counts,
+            buff_counts=buff_counts,
         )
         current = make_snapshot(
-            NOW, prices[-1], volume=(volumes or [100])[-1],
+            NOW,
+            prices[-1],
+            volume=(volumes or [100])[-1],
             steam_count=(steam_counts or [100])[-1],
             buff_count=(buff_counts or [100])[-1],
         )
         grid = canonical_two_hour_rows(rows, now=NOW)
         ready, _, daily = forecast_seven_days(rows, current, now=NOW)
-        ready.update({
-            "status": "ready",
-            "predicted_steam_net": current.steam_net * (1 + forecast_change),
-            "change_pct": forecast_change * 100,
-        })
+        ready.update(
+            {
+                "status": "ready",
+                "predicted_steam_net": current.steam_net * (1 + forecast_change),
+                "change_pct": forecast_change * 100,
+            }
+        )
         return assess_risk(
-            grid, daily, current,
-            {"t7_steam_net_p25": current.steam_net}, ready,
+            grid,
+            daily,
+            current,
+            ready,
         )
 
     def test_high_volatility_is_separate_dimension(self):
@@ -279,25 +297,20 @@ class RiskDimensionTestCase(unittest.TestCase):
 
     def test_recent_variance_acceleration_upgrades_level(self):
         prices = [10.0] * 16
-        for change in [1.01, 0.99, 1.01, 0.99, 1.02, 0.98, 1.02, 0.98,
-                       1.03, 0.97, 1.03, 0.97, 1.03, 0.97]:
+        for change in [1.01, 0.99, 1.01, 0.99, 1.02, 0.98, 1.02, 0.98, 1.03, 0.97, 1.03, 0.97, 1.03, 0.97]:
             prices.append(prices[-1] * change)
 
         risk = self._assessment(prices)
         dimension = risk["dimensions"]["volatility"]
 
         self.assertIn(dimension["level"], {"medium", "high"})
-        self.assertGreaterEqual(
-            dimension["metrics"]["variance_ratio_7d_vs_prior7d"], 1.5
-        )
+        self.assertGreaterEqual(dimension["metrics"]["variance_ratio_7d_vs_prior7d"], 1.5)
 
     def test_inventory_pressure_uses_three_indicators(self):
         steam_counts = [100] * 23 + [100, 103, 106, 109, 112, 115, 120]
         buff_counts = [100] * 23 + [100, 102, 104, 106, 108, 110, 112]
 
-        risk = self._assessment(
-            [10.0] * 30, steam_counts=steam_counts, buff_counts=buff_counts
-        )
+        risk = self._assessment([10.0] * 30, steam_counts=steam_counts, buff_counts=buff_counts)
 
         self.assertEqual(risk["dimensions"]["inventory"]["level"], "high")
 
@@ -320,9 +333,7 @@ class RiskDimensionTestCase(unittest.TestCase):
     def test_falling_price_with_rising_volume_confirms_sell_pressure(self):
         volumes = [100] * 23 + [130] * 7
 
-        risk = self._assessment(
-            [10.0] * 30, volumes=volumes, forecast_change=-0.06
-        )
+        risk = self._assessment([10.0] * 30, volumes=volumes, forecast_change=-0.06)
 
         self.assertEqual(risk["dimensions"]["price"]["level"], "high")
         self.assertEqual(risk["dimensions"]["volume"]["level"], "high")
@@ -369,9 +380,7 @@ class RiskDimensionTestCase(unittest.TestCase):
         rows = series_rows([10.0] * 30)
         current = make_snapshot(NOW, 10.0)
 
-        forecast, risk = forecast_and_risk(
-            rows, current, {"t7_steam_net_p25": current.steam_net}, now=NOW
-        )
+        forecast, risk = forecast_and_risk(rows, current, now=NOW)
 
         self.assertEqual(forecast["status"], "ready")
         self.assertEqual(risk["status"], "ready")
@@ -382,9 +391,7 @@ class RiskDimensionTestCase(unittest.TestCase):
         rows = series_rows([10.0] * 30)
         current = make_snapshot(NOW, 0.0)
 
-        forecast, risk = forecast_and_risk(
-            rows, current, {"t7_steam_net_p25": None}, now=NOW
-        )
+        forecast, risk = forecast_and_risk(rows, current, now=NOW)
 
         self.assertEqual(forecast["status"], "price_missing")
         self.assertIsNone(risk["risk_steam_net"])
@@ -395,13 +402,13 @@ class RiskDimensionTestCase(unittest.TestCase):
         current = make_snapshot(NOW, 10.0, buff_price=7.0)
         forecast, grid, daily = forecast_seven_days(rows, current, now=NOW)
         risk = assess_risk(
-            grid, daily, current,
-            {"t7_steam_net_p25": current.steam_net * 0.95}, forecast,
+            grid,
+            daily,
+            current,
+            forecast,
         )
 
-        self.assertGreaterEqual(
-            risk["risk_balance_ratio"], forecast["forecast_balance_ratio"]
-        )
+        self.assertGreaterEqual(risk["risk_balance_ratio"], forecast["forecast_balance_ratio"])
 
 
 if __name__ == "__main__":

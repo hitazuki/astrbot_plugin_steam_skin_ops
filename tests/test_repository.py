@@ -41,9 +41,7 @@ class RepositorySchemaTests(unittest.TestCase):
             )
             conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
             try:
-                schema = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-                ).fetchall()
+                schema = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
             finally:
                 conn.close()
             self.assertEqual(schema, [("metadata",), ("sentinel",)])
@@ -68,10 +66,7 @@ class RepositorySchemaTests(unittest.TestCase):
                     writer.execute("PRAGMA journal_mode=WAL").fetchone()[0],
                     "wal",
                 )
-                writer.execute(
-                    "UPDATE metadata SET value='99',updated_at='wal-file' "
-                    "WHERE key='schema_version'"
-                )
+                writer.execute("UPDATE metadata SET value='99',updated_at='wal-file' WHERE key='schema_version'")
                 writer.commit()
                 before_schema = writer.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
@@ -82,16 +77,11 @@ class RepositorySchemaTests(unittest.TestCase):
                     MonitorStorage(path)
 
                 self.assertEqual(
-                    writer.execute(
-                        "SELECT value FROM metadata WHERE key='schema_version'"
-                    ).fetchone()[0],
+                    writer.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],
                     "99",
                 )
                 self.assertEqual(
-                    writer.execute(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type='table' ORDER BY name"
-                    ).fetchall(),
+                    writer.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall(),
                     before_schema,
                 )
                 self.assertEqual(
@@ -133,12 +123,7 @@ class RepositorySchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
             with storage.connect() as conn:
-                tables = {
-                    str(row[0])
-                    for row in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    )
-                }
+                tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
             self.assertEqual(storage.get_metadata("schema_version"), str(SCHEMA_VERSION))
             self.assertIn("recommendation_history_cache", tables)
@@ -157,19 +142,19 @@ class RepositorySchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "v7.db"
             storage = MonitorStorage(path)
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "smis:1579",
-                "appid": 730,
-                "name": "Test Item",
-                "name_zh": "测试饰品",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Test Item",
+                    "name_zh": "测试饰品",
+                }
+            )
             rule = storage.add_rule(1579, "recipient:a", "ratio", 72)
             with storage.connect() as conn:
                 conn.execute("DROP TABLE recommendation_history_cache")
-                conn.execute(
-                    "UPDATE metadata SET value='7' WHERE key='schema_version'"
-                )
+                conn.execute("UPDATE metadata SET value='7' WHERE key='schema_version'")
 
             migrated = MonitorStorage(path)
 
@@ -180,8 +165,7 @@ class RepositorySchemaTests(unittest.TestCase):
             self.assertEqual(migrated.list_rules()[0]["id"], rule["id"])
             with migrated.connect() as conn:
                 table = conn.execute(
-                    "SELECT 1 FROM sqlite_master "
-                    "WHERE type='table' AND name='recommendation_history_cache'"
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recommendation_history_cache'"
                 ).fetchone()
             self.assertIsNotNone(table)
 
@@ -189,13 +173,15 @@ class RepositorySchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "v3-extreme.db"
             storage = MonitorStorage(path)
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "smis:1579",
-                "appid": 730,
-                "name": "Test Item",
-                "name_zh": "测试饰品",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Test Item",
+                    "name_zh": "测试饰品",
+                }
+            )
             rule = storage.add_rule(1579, "recipient:a", "steam", 1.0)
             storage.update_rule_state(
                 int(rule["id"]),
@@ -333,26 +319,17 @@ class RepositorySchemaTests(unittest.TestCase):
             storage = MonitorStorage(path)
             with storage.connect() as conn:
                 rules = conn.execute(
-                    "SELECT id,enabled,operational,rule_type,threshold,created_at "
-                    "FROM rules ORDER BY id"
+                    "SELECT id,enabled,operational,rule_type,threshold,created_at FROM rules ORDER BY id"
                 ).fetchall()
-                states = conn.execute(
-                    "SELECT rule_id,last_value FROM rule_states ORDER BY rule_id"
-                ).fetchall()
-                alerts = conn.execute(
-                    "SELECT id,rule_id,title FROM alert_events ORDER BY id"
-                ).fetchall()
+                states = conn.execute("SELECT rule_id,last_value FROM rule_states ORDER BY rule_id").fetchall()
+                alerts = conn.execute("SELECT id,rule_id,title FROM alert_events ORDER BY id").fetchall()
                 legacy_state = conn.execute("SELECT * FROM monitor_state").fetchall()
-                legacy_events = conn.execute(
-                    "SELECT * FROM notification_events"
-                ).fetchall()
+                legacy_events = conn.execute("SELECT * FROM notification_events").fetchall()
                 index = conn.execute(
-                    "SELECT sql FROM sqlite_master "
-                    "WHERE type='index' AND name='uq_rules_active_identity'"
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_rules_active_identity'"
                 ).fetchone()
                 pending_event_ids = conn.execute(
-                    "SELECT event_id FROM delivery_jobs "
-                    "WHERE status='pending' ORDER BY event_id"
+                    "SELECT event_id FROM delivery_jobs WHERE status='pending' ORDER BY event_id"
                 ).fetchall()
 
             self.assertEqual(
@@ -390,11 +367,7 @@ class RepositorySchemaTests(unittest.TestCase):
                 [11, 13, 14, 16],
             )
             self.assertEqual(
-                len(
-                    storage.list_rules(
-                        recipient_key="recipient:a", enabled_only=False
-                    )
-                ),
+                len(storage.list_rules(recipient_key="recipient:a", enabled_only=False)),
                 8,
             )
 
@@ -435,13 +408,15 @@ class RepositorySchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "v5-orphan.db"
             storage = MonitorStorage(path)
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "smis:1579",
-                "appid": 730,
-                "name": "Test Item",
-                "name_zh": "测试饰品",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Test Item",
+                    "name_zh": "测试饰品",
+                }
+            )
             rule = storage.add_rule(1579, "recipient:a", "ratio", 72)
             storage.enqueue_notification(
                 "health:smis:1579:recipient:a:down:3",
@@ -454,9 +429,7 @@ class RepositorySchemaTests(unittest.TestCase):
             with storage.connect() as conn:
                 conn.execute("UPDATE rules SET enabled=0 WHERE id=?", (rule["id"],))
                 conn.execute("DELETE FROM items WHERE smis_id=1579")
-                conn.execute(
-                    "UPDATE metadata SET value='5' WHERE key='schema_version'"
-                )
+                conn.execute("UPDATE metadata SET value='5' WHERE key='schema_version'")
 
             migrated = MonitorStorage(path)
 
@@ -484,24 +457,28 @@ class RepositorySchemaTests(unittest.TestCase):
     def test_add_rule_is_concurrently_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "item:1579",
-                "appid": 730,
-                "name": "Test Item",
-                "name_zh": "测试饰品",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "item:1579",
+                    "appid": 730,
+                    "name": "Test Item",
+                    "name_zh": "测试饰品",
+                }
+            )
 
             with ThreadPoolExecutor(max_workers=16) as executor:
-                results = list(executor.map(
-                    lambda _: storage.add_rule(
-                        1579,
-                        "recipient:a",
-                        "platform",
-                        4.2,
-                    ),
-                    range(32),
-                ))
+                results = list(
+                    executor.map(
+                        lambda _: storage.add_rule(
+                            1579,
+                            "recipient:a",
+                            "platform",
+                            4.2,
+                        ),
+                        range(32),
+                    )
+                )
 
             self.assertEqual({int(result["id"]) for result in results}, {1})
             self.assertEqual(len(storage.list_rules()), 1)
@@ -509,13 +486,15 @@ class RepositorySchemaTests(unittest.TestCase):
     def test_storage_canonicalizes_rule_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "item:1579",
-                "appid": 730,
-                "name": "Test Item",
-                "name_zh": "测试饰品",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "item:1579",
+                    "appid": 730,
+                    "name": "Test Item",
+                    "name_zh": "测试饰品",
+                }
+            )
 
             first = storage.add_rule(1579, "recipient:a", " PLATFORM ", 4.2)
             second = storage.add_rule(1579, "recipient:a", "platform", 4.2)
@@ -527,13 +506,15 @@ class RepositorySchemaTests(unittest.TestCase):
     def test_updating_threshold_cancels_old_pending_delivery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "item:1579",
-                "appid": 730,
-                "name": "Test Item",
-                "name_zh": "测试饰品",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "item:1579",
+                    "appid": 730,
+                    "name": "Test Item",
+                    "name_zh": "测试饰品",
+                }
+            )
             rule = storage.add_rule(1579, "recipient:a", "ratio", 72)
             storage.enqueue_notification(
                 f"rule:{rule['id']}:old",

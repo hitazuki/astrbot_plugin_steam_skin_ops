@@ -66,9 +66,7 @@ def client_with(responses, *, retries=3, interval=1.0):
 
 class SmisClientTestCase(unittest.TestCase):
     def test_global_rate_limit_applies_across_threads(self):
-        client, session, fake_time = client_with(
-            [FakeResponse(), FakeResponse(), FakeResponse()], interval=1.5
-        )
+        client, session, fake_time = client_with([FakeResponse(), FakeResponse(), FakeResponse()], interval=1.5)
 
         with ThreadPoolExecutor(max_workers=3) as executor:
             results = list(executor.map(client.fetch_metadata, [61753] * 3))
@@ -80,19 +78,19 @@ class SmisClientTestCase(unittest.TestCase):
     def test_access_denied_and_other_client_errors_do_not_retry(self):
         for status, message in ((403, "拒绝访问"), (404, "不可接受")):
             with self.subTest(status=status):
-                client, session, _ = client_with(
-                    [FakeResponse(status), FakeResponse()], retries=3
-                )
+                client, session, _ = client_with([FakeResponse(status), FakeResponse()], retries=3)
                 with self.assertRaisesRegex(SmisClientError, message):
                     client.fetch_metadata(61753)
                 self.assertEqual(len(session.request_times), 1)
 
     def test_rate_limit_respects_retry_after_and_server_error_backs_off(self):
-        client, session, fake_time = client_with([
-            FakeResponse(429, headers={"Retry-After": "7"}),
-            FakeResponse(503),
-            FakeResponse(),
-        ])
+        client, session, fake_time = client_with(
+            [
+                FakeResponse(429, headers={"Retry-After": "7"}),
+                FakeResponse(503),
+                FakeResponse(),
+            ]
+        )
 
         result = client.fetch_metadata(61753)
 
@@ -101,9 +99,7 @@ class SmisClientTestCase(unittest.TestCase):
         self.assertEqual(fake_time.sleeps, [7.0, 2])
 
     def test_retryable_error_reports_exhaustion(self):
-        client, session, _ = client_with(
-            [FakeResponse(500), FakeResponse(502)], retries=2
-        )
+        client, session, _ = client_with([FakeResponse(500), FakeResponse(502)], retries=2)
 
         with self.assertRaisesRegex(SmisClientError, "重试耗尽.*HTTP 502"):
             client.fetch_metadata(61753)
@@ -112,18 +108,20 @@ class SmisClientTestCase(unittest.TestCase):
     def test_exchange_candidates_use_required_filters_and_map_snapshots(self):
         payload = {
             "code": 200,
-            "data": [{
-                "id": 100,
-                "appid": 730,
-                "hashName": "Example Item",
-                "cnName": "示例饰品",
-                "updateTime": "2026-07-30 01:00:00",
-                "buffSellPrice": 70,
-                "buffSellNum": 10,
-                "steamSellPrice": 115,
-                "steamSellNum": 200,
-                "steamTransactionQuantity": 100,
-            }],
+            "data": [
+                {
+                    "id": 100,
+                    "appid": 730,
+                    "hashName": "Example Item",
+                    "cnName": "示例饰品",
+                    "updateTime": "2026-07-30 01:00:00",
+                    "buffSellPrice": 70,
+                    "buffSellNum": 10,
+                    "steamSellPrice": 115,
+                    "steamSellNum": 200,
+                    "steamTransactionQuantity": 100,
+                }
+            ],
         }
         client, session, _ = client_with([FakeResponse(payload=payload)])
 

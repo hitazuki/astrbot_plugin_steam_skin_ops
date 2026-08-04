@@ -11,6 +11,7 @@ from typing import Any
 
 from .market import MarketSnapshot
 from .risk import FORECAST_MODEL_VERSION, volume_cohort
+from .sqlite_schema import preflight_schema_version
 
 EVALUATION_SCHEMA_VERSION = 1
 EVALUATION_RETENTION_DAYS = 180
@@ -21,11 +22,10 @@ class ForecastEvaluationStorage:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        version = self._read_version() if self.path.exists() else 0
+        version = preflight_schema_version(self.path) if self.path.exists() else 0
         if version > EVALUATION_SCHEMA_VERSION:
             raise RuntimeError(
-                f"forecast evaluation schema v{version} is newer than supported "
-                f"v{EVALUATION_SCHEMA_VERSION}"
+                f"forecast evaluation schema v{version} is newer than supported v{EVALUATION_SCHEMA_VERSION}"
             )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
@@ -42,22 +42,6 @@ class ForecastEvaluationStorage:
         except Exception:
             conn.rollback()
             raise
-        finally:
-            conn.close()
-
-    def _read_version(self) -> int:
-        uri = f"{self.path.resolve().as_uri()}?mode=ro&immutable=1"
-        conn = sqlite3.connect(uri, uri=True)
-        try:
-            exists = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'"
-            ).fetchone()
-            if not exists:
-                return 0
-            row = conn.execute(
-                "SELECT value FROM metadata WHERE key='schema_version'"
-            ).fetchone()
-            return int(row[0]) if row else 0
         finally:
             conn.close()
 
@@ -138,9 +122,7 @@ class ForecastEvaluationStorage:
             "schema_version": "forecast_source_digest.v1",
             "source": snapshot.source,
             "source_cutoff_at_utc": issued_at.isoformat(),
-            "source_updated_at_utc": snapshot.source_updated_at.astimezone(
-                timezone.utc
-            ).isoformat(),
+            "source_updated_at_utc": snapshot.source_updated_at.astimezone(timezone.utc).isoformat(),
             "source_digest_sha256": str(source_digest),
         }
         payload = json.dumps(
@@ -151,7 +133,8 @@ class ForecastEvaluationStorage:
         )
         with self.connect() as conn:
             before = conn.total_changes
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT OR IGNORE INTO forecast_issuances(
                     item_key,smis_id,appid,name,name_zh,issue_date,issued_at,
                     target_at,status,volume_cohort,mode,model_version,
@@ -159,29 +142,31 @@ class ForecastEvaluationStorage:
                     probability_up,interval_source,feature_schema_version,
                     feature_json,updated_at
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                snapshot.item_key,
-                snapshot.smis_id,
-                snapshot.appid,
-                snapshot.name,
-                snapshot.name_zh,
-                issue_date.isoformat(),
-                issued_at.isoformat(),
-                target_at.isoformat(),
-                status,
-                volume_cohort(snapshot.steam_transaction_quantity),
-                forecast.get("mode"),
-                FORECAST_MODEL_VERSION,
-                snapshot.steam_net or None,
-                forecast.get("p20_steam_net"),
-                forecast.get("predicted_steam_net"),
-                forecast.get("p80_steam_net"),
-                forecast.get("probability_up"),
-                forecast.get("interval_source"),
-                source_record["schema_version"],
-                payload,
-                datetime.now(timezone.utc).isoformat(),
-            ))
+            """,
+                (
+                    snapshot.item_key,
+                    snapshot.smis_id,
+                    snapshot.appid,
+                    snapshot.name,
+                    snapshot.name_zh,
+                    issue_date.isoformat(),
+                    issued_at.isoformat(),
+                    target_at.isoformat(),
+                    status,
+                    volume_cohort(snapshot.steam_transaction_quantity),
+                    forecast.get("mode"),
+                    FORECAST_MODEL_VERSION,
+                    snapshot.steam_net or None,
+                    forecast.get("p20_steam_net"),
+                    forecast.get("predicted_steam_net"),
+                    forecast.get("p80_steam_net"),
+                    forecast.get("probability_up"),
+                    forecast.get("interval_source"),
+                    source_record["schema_version"],
+                    payload,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
             return conn.total_changes > before
 
     @staticmethod
@@ -197,16 +182,19 @@ class ForecastEvaluationStorage:
             return 0
         observed = snapshot.observed_at.astimezone(timezone.utc)
         with self.connect() as conn:
-            rows = conn.execute("""
+            rows = conn.execute(
+                """
                 SELECT * FROM forecast_issuances
                 WHERE item_key=? AND status='pending' AND target_at<=?
                   AND target_at>=?
                 ORDER BY target_at,id
-            """, (
-                snapshot.item_key,
-                observed.isoformat(),
-                (observed - timedelta(hours=24)).isoformat(),
-            )).fetchall()
+            """,
+                (
+                    snapshot.item_key,
+                    observed.isoformat(),
+                    (observed - timedelta(hours=24)).isoformat(),
+                ),
+            ).fetchall()
             resolved = 0
             for row in rows:
                 predicted = float(row["p50_steam_net"])
@@ -214,35 +202,32 @@ class ForecastEvaluationStorage:
                 actual = snapshot.steam_net
                 log_residual = math.log(actual / predicted)
                 signed_error = (predicted / actual - 1) * 100
-                direction_correct = self._direction(predicted / current - 1) == (
-                    self._direction(actual / current - 1)
-                )
-                interval_hit = (
-                    float(row["p20_steam_net"]) <= actual
-                    <= float(row["p80_steam_net"])
-                )
+                direction_correct = self._direction(predicted / current - 1) == (self._direction(actual / current - 1))
+                interval_hit = float(row["p20_steam_net"]) <= actual <= float(row["p80_steam_net"])
                 now = datetime.now(timezone.utc).isoformat()
-                conn.execute("""
+                conn.execute(
+                    """
                     INSERT INTO forecast_outcomes(
                         issuance_id,observed_at,source_updated_at,actual_steam_net,
                         log_residual,signed_error_pct,absolute_error_pct,
                         direction_correct,interval_hit,created_at
                     ) VALUES(?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    int(row["id"]),
-                    observed.isoformat(),
-                    snapshot.source_updated_at.astimezone(timezone.utc).isoformat(),
-                    actual,
-                    log_residual,
-                    signed_error,
-                    abs(signed_error),
-                    int(direction_correct),
-                    int(interval_hit),
-                    now,
-                ))
+                """,
+                    (
+                        int(row["id"]),
+                        observed.isoformat(),
+                        snapshot.source_updated_at.astimezone(timezone.utc).isoformat(),
+                        actual,
+                        log_residual,
+                        signed_error,
+                        abs(signed_error),
+                        int(direction_correct),
+                        int(interval_hit),
+                        now,
+                    ),
+                )
                 conn.execute(
-                    "UPDATE forecast_issuances SET status='resolved',updated_at=? "
-                    "WHERE id=?",
+                    "UPDATE forecast_issuances SET status='resolved',updated_at=? WHERE id=?",
                     (now, int(row["id"])),
                 )
                 resolved += 1
@@ -253,8 +238,7 @@ class ForecastEvaluationStorage:
         with self.connect() as conn:
             before = conn.total_changes
             conn.execute(
-                "UPDATE forecast_issuances SET status='missed',updated_at=? "
-                "WHERE status='pending' AND target_at<?",
+                "UPDATE forecast_issuances SET status='missed',updated_at=? WHERE status='pending' AND target_at<?",
                 (
                     current.isoformat(),
                     (current - timedelta(hours=48)).isoformat(),
@@ -268,17 +252,18 @@ class ForecastEvaluationStorage:
         *,
         days: int = EVALUATION_RETENTION_DAYS,
     ) -> dict[str, list[float]]:
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
-        ).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).isoformat()
         with self.connect() as conn:
-            rows = conn.execute("""
+            rows = conn.execute(
+                """
                 SELECT i.mode,o.log_residual
                 FROM forecast_outcomes o
                 JOIN forecast_issuances i ON i.id=o.issuance_id
                 WHERE i.volume_cohort=? AND i.issued_at>=? AND i.mode IS NOT NULL
                 ORDER BY i.issued_at
-            """, (cohort, cutoff)).fetchall()
+            """,
+                (cohort, cutoff),
+            ).fetchall()
         grouped: dict[str, list[float]] = {}
         for row in rows:
             grouped.setdefault(str(row["mode"]), []).append(float(row["log_residual"]))
@@ -307,8 +292,7 @@ class ForecastEvaluationStorage:
         where = " AND ".join(filters)
         with self.connect() as conn:
             status_rows = conn.execute(
-                f"SELECT i.status,COUNT(*) AS count FROM forecast_issuances i "
-                f"WHERE {where} GROUP BY i.status",
+                f"SELECT i.status,COUNT(*) AS count FROM forecast_issuances i WHERE {where} GROUP BY i.status",
                 params,
             ).fetchall()
             metric_rows = conn.execute(
@@ -334,9 +318,7 @@ class ForecastEvaluationStorage:
                 "bias_pct": round(float(row["bias_pct"]), 2),
                 "direction_accuracy": round(float(row["direction_accuracy"]), 4),
                 "interval_coverage": round(float(row["interval_coverage"]), 4),
-                "sample_quality": (
-                    "sufficient" if int(row["resolved_count"]) >= 30 else "small_sample"
-                ),
+                "sample_quality": ("sufficient" if int(row["resolved_count"]) >= 30 else "small_sample"),
             }
             for row in metric_rows
         ]
@@ -351,16 +333,17 @@ class ForecastEvaluationStorage:
         }
 
     def prune(self, retain_days: int = EVALUATION_RETENTION_DAYS) -> int:
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=max(1, int(retain_days)))
-        ).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(retain_days)))).isoformat()
         with self.connect() as conn:
             before = conn.total_changes
-            conn.execute("""
+            conn.execute(
+                """
                 DELETE FROM forecast_outcomes WHERE issuance_id IN (
                     SELECT id FROM forecast_issuances WHERE issued_at<?
                 )
-            """, (cutoff,))
+            """,
+                (cutoff,),
+            )
             conn.execute(
                 "DELETE FROM forecast_issuances WHERE issued_at<?",
                 (cutoff,),

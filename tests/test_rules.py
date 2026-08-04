@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Barrier
+from threading import Barrier, Event
 
 from core.alerting import evaluate_rule_transition
 from core.manager import MonitoringManager, ServiceError
@@ -69,6 +69,19 @@ class BarrierCatalogSource(StaticSource):
             "name": f"Item {int(smis_id)}",
             "name_zh": f"饰品 {int(smis_id)}",
         }
+
+
+class BlockingSource(StaticSource):
+    def __init__(self):
+        super().__init__()
+        self.started = Event()
+        self.release = Event()
+
+    def fetch_current(self, item):
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("test did not release current fetch")
+        return super().fetch_current(item)
 
 
 class RuleContractTestCase(unittest.TestCase):
@@ -193,37 +206,39 @@ class RuleContractTestCase(unittest.TestCase):
             parse_rule_state_integer(MAX_RULE_STATE_INTEGER),
             MAX_RULE_STATE_INTEGER,
         )
-        self.assertIsNone(
-            parse_rule_state_integer(MAX_RULE_STATE_INTEGER + 1)
-        )
+        self.assertIsNone(parse_rule_state_integer(MAX_RULE_STATE_INTEGER + 1))
 
     def test_non_finite_market_prices_fail_closed(self):
         base = market_snapshot()
-        platform_snapshot = MarketSnapshot(**{
-            **base.__dict__,
-            "buff_sell_price": math.inf,
-        })
-        steam_snapshot = MarketSnapshot(**{
-            **base.__dict__,
-            "steam_sell_price": math.inf,
-        })
-
-        self.assertIsNone(
-            measure_rule(platform_snapshot, {}, "platform").value
+        platform_snapshot = MarketSnapshot(
+            **{
+                **base.__dict__,
+                "buff_sell_price": math.inf,
+            }
         )
+        steam_snapshot = MarketSnapshot(
+            **{
+                **base.__dict__,
+                "steam_sell_price": math.inf,
+            }
+        )
+
+        self.assertIsNone(measure_rule(platform_snapshot, {}, "platform").value)
         self.assertIsNone(measure_rule(steam_snapshot, {}, "steam").value)
         self.assertIsNone(measure_rule(steam_snapshot, {}, "ratio").value)
 
     def test_corrupt_rule_does_not_block_later_valid_rule(self):
         with TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "smis:1579",
-                "appid": 730,
-                "name": "Fracture Case",
-                "name_zh": "裂空武器箱",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Fracture Case",
+                    "name_zh": "裂空武器箱",
+                }
+            )
             invalid = storage.add_rule(1579, "umo:a", "future-rule", 10)
             valid = storage.add_rule(1579, "umo:a", "ratio", 72)
             manager = MonitoringManager(storage, StaticSource())
@@ -250,13 +265,15 @@ class RuleContractTestCase(unittest.TestCase):
     def test_persisted_non_finite_threshold_is_quarantined(self):
         with TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "smis:1579",
-                "appid": 730,
-                "name": "Fracture Case",
-                "name_zh": "裂空武器箱",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Fracture Case",
+                    "name_zh": "裂空武器箱",
+                }
+            )
             rule = storage.add_rule(1579, "umo:a", "platform", math.inf)
             storage.update_rule_state(
                 int(rule["id"]),
@@ -317,23 +334,28 @@ class RuleContractTestCase(unittest.TestCase):
     def test_corrupt_persisted_state_is_quarantined_during_startup(self):
         with TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "smis:1579",
-                "appid": 730,
-                "name": "Fracture Case",
-                "name_zh": "裂空武器箱",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Fracture Case",
+                    "name_zh": "裂空武器箱",
+                }
+            )
             rule = storage.add_rule(1579, "umo:a", "platform", 4.0)
             storage.update_rule_state(int(rule["id"]), alert_active=1, last_value=3.2)
             with storage.connect() as conn:
-                conn.execute("""
+                conn.execute(
+                    """
                     UPDATE rule_states
                     SET alert_active='broken',qualifying_count='broken',
                         clearing_count='broken',last_value='broken',
                         highest_notified_level='broken'
                     WHERE rule_id=?
-                """, (int(rule["id"]),))
+                """,
+                    (int(rule["id"]),),
+                )
 
             MonitoringManager(storage, StaticSource())
 
@@ -349,13 +371,15 @@ class RuleContractTestCase(unittest.TestCase):
     def test_oversized_finite_state_is_quarantined_before_alerting(self):
         with TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "smis:1579",
-                "appid": 730,
-                "name": "Fracture Case",
-                "name_zh": "裂空武器箱",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Fracture Case",
+                    "name_zh": "裂空武器箱",
+                }
+            )
             rule = storage.add_rule(1579, "umo:a", "platform", 4.0)
             storage.update_rule_state(int(rule["id"]), qualifying_count=1)
             with storage.connect() as conn:
@@ -375,13 +399,15 @@ class RuleContractTestCase(unittest.TestCase):
     def test_active_fractional_state_is_audited_before_level_sync(self):
         with TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "smis:1579",
-                "appid": 730,
-                "name": "Fracture Case",
-                "name_zh": "裂空武器箱",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Fracture Case",
+                    "name_zh": "裂空武器箱",
+                }
+            )
             rule = storage.add_rule(1579, "umo:a", "platform", 4.0)
             storage.update_rule_state(
                 int(rule["id"]),
@@ -390,8 +416,7 @@ class RuleContractTestCase(unittest.TestCase):
             )
             with storage.connect() as conn:
                 conn.execute(
-                    "UPDATE rule_states SET qualifying_count=0.5,"
-                    "highest_notified_level=0.5 WHERE rule_id=?",
+                    "UPDATE rule_states SET qualifying_count=0.5,highest_notified_level=0.5 WHERE rule_id=?",
                     (int(rule["id"]),),
                 )
 
@@ -406,13 +431,15 @@ class RuleContractTestCase(unittest.TestCase):
     def test_runtime_state_corruption_quarantines_rule_permanently(self):
         with TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
-            storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "smis:1579",
-                "appid": 730,
-                "name": "Fracture Case",
-                "name_zh": "裂空武器箱",
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Fracture Case",
+                    "name_zh": "裂空武器箱",
+                }
+            )
             rule = storage.add_rule(1579, "umo:a", "platform", 4.0)
             manager = MonitoringManager(storage, StaticSource())
             storage.update_rule_state(int(rule["id"]), qualifying_count=1)
@@ -435,13 +462,15 @@ class RuleContractTestCase(unittest.TestCase):
             storage = MonitorStorage(Path(tmp) / "monitor.db")
             for index in range(19):
                 smis_id = 1000 + index
-                storage.upsert_item({
-                    "smis_id": smis_id,
-                    "item_key": f"smis:{smis_id}",
-                    "appid": 730,
-                    "name": f"Item {smis_id}",
-                    "name_zh": f"饰品 {smis_id}",
-                })
+                storage.upsert_item(
+                    {
+                        "smis_id": smis_id,
+                        "item_key": f"smis:{smis_id}",
+                        "appid": 730,
+                        "name": f"Item {smis_id}",
+                        "name_zh": f"饰品 {smis_id}",
+                    }
+                )
                 storage.add_rule(
                     smis_id,
                     f"umo:{index}",
@@ -468,17 +497,55 @@ class RuleContractTestCase(unittest.TestCase):
             self.assertEqual(storage.count_rule_items(), 20)
             self.assertEqual(storage.count_items(), 20)
 
+    def test_deleted_rule_cannot_commit_stale_transition_or_alert(self):
+        with TemporaryDirectory() as tmp:
+            storage = MonitorStorage(Path(tmp) / "monitor.db")
+            storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Fracture Case",
+                    "name_zh": "裂空武器箱",
+                }
+            )
+            rule = storage.add_rule(1579, "umo:a", "platform", 4.0)
+            source = BlockingSource()
+            manager = MonitoringManager(storage, source)
+            item = storage.get_item(1579)
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(manager.monitor_item, item)
+                self.assertTrue(source.started.wait(timeout=5))
+                self.assertTrue(storage.delete_rule(int(rule["id"]), "umo:a"))
+                source.release.set()
+                self.assertTrue(future.result(timeout=5)["success"])
+
+            self.assertIsNone(storage.get_rule(int(rule["id"])))
+            self.assertEqual(
+                storage.list_events("umo:a", acknowledged=None),
+                [],
+            )
+            with storage.connect() as conn:
+                state = conn.execute(
+                    "SELECT 1 FROM rule_states WHERE rule_id=?",
+                    (int(rule["id"]),),
+                ).fetchone()
+            self.assertIsNone(state)
+
     def test_corrupt_operational_value_cannot_bypass_item_limit(self):
         with TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
             for smis_id in (1001, 1002):
-                storage.upsert_item({
-                    "smis_id": smis_id,
-                    "item_key": f"smis:{smis_id}",
-                    "appid": 730,
-                    "name": f"Item {smis_id}",
-                    "name_zh": f"饰品 {smis_id}",
-                })
+                storage.upsert_item(
+                    {
+                        "smis_id": smis_id,
+                        "item_key": f"smis:{smis_id}",
+                        "appid": 730,
+                        "name": f"Item {smis_id}",
+                        "name_zh": f"饰品 {smis_id}",
+                    }
+                )
             storage.add_rule(1001, "umo:a", "ratio", 72)
             second = storage.add_rule(1002, "umo:a", "ratio", 72)
             storage.set_rule_operational(

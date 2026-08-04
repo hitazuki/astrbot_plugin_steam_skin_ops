@@ -49,7 +49,10 @@ Install development dependencies and run all checks before committing:
 ```text
 python -m pip install -e ".[dev]"
 ruff check .
-python -m unittest discover -s tests -v
+ruff format --check .
+python -m mypy
+python -m coverage run -m unittest discover -s tests -v
+python -m coverage report
 python -m compileall -q main.py core
 python scripts/validate_market_package.py
 ```

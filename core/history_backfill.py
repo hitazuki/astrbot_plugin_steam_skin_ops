@@ -39,10 +39,7 @@ class HistoryBackfiller:
         attempted = self.storage.get_metadata(key)
         if attempted and attempted != "done":
             try:
-                if (
-                    datetime.now(timezone.utc) - datetime.fromisoformat(attempted)
-                    < timedelta(hours=6)
-                ):
+                if datetime.now(timezone.utc) - datetime.fromisoformat(attempted) < timedelta(hours=6):
                     return None
             except ValueError:
                 pass
@@ -59,10 +56,7 @@ class HistoryBackfiller:
         try:
             pending = json.loads(raw)
             attempted = pending.get("attempted_at")
-            if attempted and (
-                datetime.now(timezone.utc) - datetime.fromisoformat(attempted)
-                < timedelta(hours=6)
-            ):
+            if attempted and (datetime.now(timezone.utc) - datetime.fromisoformat(attempted) < timedelta(hours=6)):
                 return True
             pending["attempted_at"] = datetime.now(timezone.utc).isoformat()
             self.storage.set_metadata(pending_key, json.dumps(pending))
@@ -91,11 +85,7 @@ class HistoryBackfiller:
             (snapshot.observed_at - previous_observed).total_seconds(),
         )
         had_failure = any(
-            int(
-                self.storage.get_health_state(
-                    item["smis_id"], str(rule["recipient_key"])
-                )["fetch_failures"]
-            ) > 0
+            int(self.storage.get_health_state(item["smis_id"], str(rule["recipient_key"]))["fetch_failures"]) > 0
             for rule in rules
         )
         missed_observation = gap_seconds > self.poll_interval_seconds * 2
@@ -104,10 +94,7 @@ class HistoryBackfiller:
         if snapshot_fingerprint(previous) == snapshot_fingerprint(snapshot):
             return
         days = max(1, min(30, math.ceil(gap_seconds / 86400)))
-        signature = (
-            f"{item['item_key']}|{previous['observed_at']}|"
-            f"{snapshot.observed_at.isoformat()}|{days}"
-        )
+        signature = f"{item['item_key']}|{previous['observed_at']}|{snapshot.observed_at.isoformat()}|{days}"
         digest = sha1(signature.encode("utf-8")).hexdigest()[:16]
         key = f"history-gap:{item['item_key']}:{digest}"
         if self.storage.get_metadata(key) == "done":

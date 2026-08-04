@@ -70,20 +70,19 @@ def evaluate_rule_transition(
             "highest_notified_level",
         )
     }
-    if (
-        any(number is None for number in state_values.values())
-        or state_values["alert_active"] not in {0, 1}
-    ):
-        return RuleTransition({
-            "alert_active": 0,
-            "qualifying_count": 0,
-            "clearing_count": 0,
-            "last_value": None,
-            "last_baseline": None,
-            "last_observed_at": observed_at,
-            "highest_notified_level": 0,
-            "status": "规则状态无效",
-        })
+    if any(number is None for number in state_values.values()) or state_values["alert_active"] not in {0, 1}:
+        return RuleTransition(
+            {
+                "alert_active": 0,
+                "qualifying_count": 0,
+                "clearing_count": 0,
+                "last_value": None,
+                "last_baseline": None,
+                "last_observed_at": observed_at,
+                "highest_notified_level": 0,
+                "status": "规则状态无效",
+            }
+        )
     active = int(state_values["alert_active"])
     qualifying_count = int(state_values["qualifying_count"])
     clearing_count = int(state_values["clearing_count"])
@@ -96,11 +95,7 @@ def evaluate_rule_transition(
         "last_baseline": finite_baseline,
         "last_observed_at": observed_at,
         "highest_notified_level": highest_level,
-        "status": (
-            measurement.status
-            if value is None or finite_value is not None
-            else "测量值无效"
-        ),
+        "status": (measurement.status if value is None or finite_value is not None else "测量值无效"),
     }
     if finite_value is None:
         changes.update({"qualifying_count": 0, "clearing_count": 0})
@@ -112,21 +107,19 @@ def evaluate_rule_transition(
     except (TypeError, ValueError):
         limit = math.nan
     if not math.isfinite(limit) or limit <= 0:
-        changes.update({
-            "alert_active": 0,
-            "qualifying_count": 0,
-            "clearing_count": 0,
-            "highest_notified_level": 0,
-            "status": "规则阈值无效",
-        })
+        changes.update(
+            {
+                "alert_active": 0,
+                "qualifying_count": 0,
+                "clearing_count": 0,
+                "highest_notified_level": 0,
+                "status": "规则阈值无效",
+            }
+        )
         return RuleTransition(changes)
     qualifies = definition.qualifies(value, limit)
     if not active:
-        qualifying = (
-            min(qualifying_count + 1, MAX_RULE_STATE_INTEGER)
-            if qualifies
-            else 0
-        )
+        qualifying = min(qualifying_count + 1, MAX_RULE_STATE_INTEGER) if qualifies else 0
         changes.update({"qualifying_count": qualifying, "clearing_count": 0})
         if qualifying < confirmations:
             return RuleTransition(changes)
@@ -136,12 +129,14 @@ def evaluate_rule_transition(
         except (ArithmeticError, TypeError, ValueError):
             changes.update({"qualifying_count": 0, "status": "测量值无效"})
             return RuleTransition(changes)
-        changes.update({
-            "alert_active": 1,
-            "qualifying_count": qualifying,
-            "last_signal_at": observed_at,
-            "highest_notified_level": level,
-        })
+        changes.update(
+            {
+                "alert_active": 1,
+                "qualifying_count": qualifying,
+                "last_signal_at": observed_at,
+                "highest_notified_level": level,
+            }
+        )
         return RuleTransition(
             changes,
             AlertSignal(
@@ -154,28 +149,28 @@ def evaluate_rule_transition(
             ),
         )
 
-    clearing = (
-        min(clearing_count + 1, MAX_RULE_STATE_INTEGER)
-        if definition.clears(value, limit)
-        else 0
-    )
+    clearing = min(clearing_count + 1, MAX_RULE_STATE_INTEGER) if definition.clears(value, limit) else 0
     changes.update({"qualifying_count": 0, "clearing_count": clearing})
     if clearing >= clear_confirmations:
-        changes.update({
-            "alert_active": 0,
-            "clearing_count": 0,
-            "highest_notified_level": 0,
-        })
+        changes.update(
+            {
+                "alert_active": 0,
+                "clearing_count": 0,
+                "highest_notified_level": 0,
+            }
+        )
         return RuleTransition(changes)
 
     try:
         level, depth = definition.breakthrough(value, limit, breakthrough_step)
     except (ArithmeticError, TypeError, ValueError):
-        changes.update({
-            "qualifying_count": 0,
-            "clearing_count": 0,
-            "status": "测量值无效",
-        })
+        changes.update(
+            {
+                "qualifying_count": 0,
+                "clearing_count": 0,
+                "status": "测量值无效",
+            }
+        )
         return RuleTransition(changes)
     previous_level = highest_level
     signal = None

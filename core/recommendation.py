@@ -79,11 +79,7 @@ class RecommendationPolicy:
                 exact_volume = float(min_steam_volume)
             except (TypeError, ValueError) as exc:
                 raise ValueError("最低 Steam 日成交量必须是大于等于 1 的整数") from exc
-            if (
-                not math.isfinite(exact_volume)
-                or exact_volume != effective_volume
-                or effective_volume < 1
-            ):
+            if not math.isfinite(exact_volume) or exact_volume != effective_volume or effective_volume < 1:
                 raise ValueError("最低 Steam 日成交量必须是大于等于 1 的整数")
 
         return replace(
@@ -143,10 +139,7 @@ def rank_recommendations(
             continue
         source_time = source_time.astimezone(timezone.utc)
         age_seconds = (current_time - source_time).total_seconds()
-        if (
-            age_seconds < -MAX_SOURCE_FUTURE_SKEW_SECONDS
-            or age_seconds > policy.max_source_age_minutes * 60
-        ):
+        if age_seconds < -MAX_SOURCE_FUTURE_SKEW_SECONDS or age_seconds > policy.max_source_age_minutes * 60:
             continue
 
         executable_quotes = [
@@ -196,8 +189,7 @@ def rank_recommendations(
             "links": {
                 "smis": f"https://smis.club/commodity/{int(snapshot.smis_id)}",
                 "steam": (
-                    "https://steamcommunity.com/market/listings/"
-                    f"{int(snapshot.appid)}/{quote(str(snapshot.name))}"
+                    f"https://steamcommunity.com/market/listings/{int(snapshot.appid)}/{quote(str(snapshot.name))}"
                 ),
             },
         }

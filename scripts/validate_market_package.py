@@ -34,21 +34,32 @@ ARCHIVE_FILES = (
     "core/__init__.py",
     "core/alerting.py",
     "core/candidate_features.py",
+    "core/catalog.py",
     "core/config.py",
+    "core/errors.py",
     "core/evaluation.py",
     "core/history.py",
     "core/history_backfill.py",
     "core/integrations/__init__.py",
     "core/integrations/smis.py",
+    "core/items.py",
     "core/llm_analysis.py",
     "core/manager.py",
     "core/market.py",
     "core/presentation.py",
     "core/recommendation.py",
+    "core/recommendation_service.py",
     "core/repository.py",
     "core/risk.py",
+    "core/rule_service.py",
     "core/rules.py",
     "core/runtime.py",
+    "core/sqlite_schema.py",
+    "core/storage/__init__.py",
+    "core/storage/market.py",
+    "core/storage/outbox.py",
+    "core/storage/recommendation_cache.py",
+    "core/storage/rules.py",
     "docs/DATA_SOURCES_AND_METHODS.md",
     "docs/recommendation_candidate.v1.schema.json",
     "logo.png",
@@ -81,18 +92,14 @@ def _requirements_from_file(path: Path) -> tuple[str, ...]:
         if not line or line.startswith("#"):
             continue
         if line.startswith(("-e ", "--editable ", "-r ", "--requirement ")):
-            raise ValueError(
-                "requirements.txt must list runtime dependencies directly"
-            )
+            raise ValueError("requirements.txt must list runtime dependencies directly")
         requirements.append(_normalise_requirement(line))
     return tuple(sorted(requirements))
 
 
 def _project_dependencies(pyproject: dict[str, Any]) -> tuple[str, ...]:
     dependencies = pyproject.get("project", {}).get("dependencies", [])
-    if not isinstance(dependencies, list) or not all(
-        isinstance(value, str) for value in dependencies
-    ):
+    if not isinstance(dependencies, list) or not all(isinstance(value, str) for value in dependencies):
         raise ValueError("project.dependencies must be a list of strings")
     return tuple(sorted(_normalise_requirement(value) for value in dependencies))
 
@@ -104,28 +111,16 @@ def validate_source(root: Path = ROOT) -> None:
         raise ValueError("ARCHIVE_FILES must be sorted")
     unknown_binary_files = sorted(BINARY_ARCHIVE_FILES - set(ARCHIVE_FILES))
     if unknown_binary_files:
-        raise ValueError(
-            "binary archive files missing from ARCHIVE_FILES: "
-            + ", ".join(unknown_binary_files)
-        )
+        raise ValueError("binary archive files missing from ARCHIVE_FILES: " + ", ".join(unknown_binary_files))
     missing = sorted(name for name in ARCHIVE_FILES if not (root / name).is_file())
     if missing:
         raise ValueError(f"missing market files: {', '.join(missing)}")
 
-    runtime_files = {
-        path.relative_to(root).as_posix()
-        for path in (root / "core").rglob("*.py")
-        if path.is_file()
-    }
-    listed_runtime_files = {
-        name for name in ARCHIVE_FILES if name.startswith("core/")
-    }
+    runtime_files = {path.relative_to(root).as_posix() for path in (root / "core").rglob("*.py") if path.is_file()}
+    listed_runtime_files = {name for name in ARCHIVE_FILES if name.startswith("core/")}
     unlisted_runtime_files = sorted(runtime_files - listed_runtime_files)
     if unlisted_runtime_files:
-        raise ValueError(
-            "runtime Python files missing from ARCHIVE_FILES: "
-            + ", ".join(unlisted_runtime_files)
-        )
+        raise ValueError("runtime Python files missing from ARCHIVE_FILES: " + ", ".join(unlisted_runtime_files))
 
     metadata = yaml.safe_load((root / "metadata.yaml").read_text(encoding="utf-8"))
     if not isinstance(metadata, dict):

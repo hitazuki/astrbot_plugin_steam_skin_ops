@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 
 import jsonschema
 
+from core.candidate_features import build_candidate_record
 from core.evaluation import ForecastEvaluationStorage
 from core.manager import MonitoringManager, ServiceError
 from core.market import MarketSnapshot, steam_net_amount
@@ -17,6 +18,7 @@ from core.recommendation import (
     score_recommendation,
 )
 from core.repository import MonitorStorage
+from core.risk import analyze_market
 
 
 def candidate(
@@ -60,25 +62,50 @@ def history(candidate_row: MarketSnapshot) -> list[MarketSnapshot]:
     rows = []
     for index in range(30 * 12):
         observed = now - timedelta(hours=(30 * 12 - index) * 2)
-        rows.append(MarketSnapshot(
-            item_key=candidate_row.item_key,
-            smis_id=candidate_row.smis_id,
-            appid=candidate_row.appid,
-            name=candidate_row.name,
-            name_zh=candidate_row.name_zh,
-            observed_at=observed,
-            source_updated_at=observed,
-            buff_sell_price=candidate_row.buff_sell_price,
-            buff_sell_num=200 - index // 12,
-            steam_sell_price=110 + index / 360,
-            steam_sell_num=220 - index // 20,
-            steam_transaction_quantity=100,
-            kind="history",
-        ))
+        rows.append(
+            MarketSnapshot(
+                item_key=candidate_row.item_key,
+                smis_id=candidate_row.smis_id,
+                appid=candidate_row.appid,
+                name=candidate_row.name,
+                name_zh=candidate_row.name_zh,
+                observed_at=observed,
+                source_updated_at=observed,
+                buff_sell_price=candidate_row.buff_sell_price,
+                buff_sell_num=200 - index // 12,
+                steam_sell_price=110 + index / 360,
+                steam_sell_num=220 - index // 20,
+                steam_transaction_quantity=100,
+                kind="history",
+            )
+        )
     return rows
 
 
 class RecommendationPolicyTestCase(unittest.TestCase):
+    def test_candidate_series_reuses_forecast_canonical_rows(self):
+        current = candidate(1, 0.70, age_minutes=120)
+        row = {
+            **current.__dict__,
+            "observed_at": current.observed_at.isoformat(),
+            "source_updated_at": current.source_updated_at.isoformat(),
+        }
+
+        analysis = analyze_market(
+            [row],
+            current,
+            stale=True,
+            now=current.observed_at,
+            max_current_lag_seconds=1800,
+        )
+        record = build_candidate_record(current, analysis)
+
+        self.assertEqual(analysis.canonical_rows, [])
+        self.assertEqual(
+            record["derived_history"]["daily_series_21d"]["date"],
+            [],
+        )
+
     def test_filters_non_executable_stale_and_illiquid_candidates(self):
         policy = RecommendationPolicy(
             min_price=30,
@@ -108,13 +135,15 @@ class RecommendationPolicyTestCase(unittest.TestCase):
 
     def test_uses_lowest_platform_with_positive_inventory(self):
         row = candidate(1, 0.75)
-        row = MarketSnapshot(**{
-            **row.__dict__,
-            "buff_sell_price": 60,
-            "buff_sell_num": 0,
-            "uuyp_sell_price": 70,
-            "uuyp_sell_num": 12,
-        })
+        row = MarketSnapshot(
+            **{
+                **row.__dict__,
+                "buff_sell_price": 60,
+                "buff_sell_num": 0,
+                "uuyp_sell_price": 70,
+                "uuyp_sell_num": 12,
+            }
+        )
 
         result = rank_recommendations([row], RecommendationPolicy())
 
@@ -166,7 +195,8 @@ class RecommendationPolicyTestCase(unittest.TestCase):
     def test_composite_score_uses_ratios_risk_and_confidence_deductions(self):
         policy = RecommendationPolicy(max_ratio=0.8)
         row = rank_recommendations(
-            [candidate(1, 0.60)], policy,
+            [candidate(1, 0.60)],
+            policy,
         )["recommendations"][0]
         forecast = {
             "status": "ready",
@@ -181,7 +211,11 @@ class RecommendationPolicyTestCase(unittest.TestCase):
         }
 
         scored = score_recommendation(
-            row, forecast, risk, policy, history_age_hours=8,
+            row,
+            forecast,
+            risk,
+            policy,
+            history_age_hours=8,
         )
 
         self.assertAlmostEqual(scored["score"], 12.5)
@@ -252,9 +286,7 @@ class RecommendationManagerTestCase(unittest.TestCase):
     def test_v3_candidate_matches_schema_and_does_not_issue_evaluation(self):
         with TemporaryDirectory() as tmp:
             source = FakeRecommendationSource([candidate(1, 0.70)])
-            evaluation = ForecastEvaluationStorage(
-                Path(tmp) / "forecast_evaluation.db"
-            )
+            evaluation = ForecastEvaluationStorage(Path(tmp) / "forecast_evaluation.db")
             manager = MonitoringManager(
                 MonitorStorage(Path(tmp) / "monitor.db"),
                 source,
@@ -264,10 +296,7 @@ class RecommendationManagerTestCase(unittest.TestCase):
             result = manager.recommend()
             record = result["candidate_records"][0]
             schema = json.loads(
-                (Path(__file__).parents[1]
-                 / "docs/recommendation_candidate.v1.schema.json").read_text(
-                    encoding="utf-8"
-                )
+                (Path(__file__).parents[1] / "docs/recommendation_candidate.v1.schema.json").read_text(encoding="utf-8")
             )
             jsonschema.Draft202012Validator(schema).validate(record)
             series = record["derived_history"]["daily_series_21d"]
@@ -277,13 +306,9 @@ class RecommendationManagerTestCase(unittest.TestCase):
                 record["deterministic_ranking"]["weights"],
                 {"t7": 0.4, "risk_ratio": 0.35, "instant": 0.25},
             )
-            self.assertFalse(
-                record["llm_contract"]["may_override_deterministic_score"]
-            )
+            self.assertFalse(record["llm_contract"]["may_override_deterministic_score"])
             with evaluation.connect() as connection:
-                issued = connection.execute(
-                    "SELECT COUNT(*) FROM forecast_issuances"
-                ).fetchone()[0]
+                issued = connection.execute("SELECT COUNT(*) FROM forecast_issuances").fetchone()[0]
             self.assertEqual(issued, 0)
 
     def test_manager_reports_invalid_budget_and_source_failure(self):
@@ -319,9 +344,7 @@ class RecommendationManagerTestCase(unittest.TestCase):
 
     def test_cold_history_requests_are_capped_at_eight(self):
         with TemporaryDirectory() as tmp:
-            source = FakeRecommendationSource([
-                candidate(index, 0.60) for index in range(1, 13)
-            ])
+            source = FakeRecommendationSource([candidate(index, 0.60) for index in range(1, 13)])
             manager = MonitoringManager(
                 MonitorStorage(Path(tmp) / "monitor.db"),
                 source,
@@ -400,13 +423,15 @@ class RecommendationCacheTestCase(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             storage = MonitorStorage(Path(tmp) / "monitor.db")
             row = candidate(1, 0.70)
-            storage.upsert_item({
-                "smis_id": row.smis_id,
-                "item_key": row.item_key,
-                "appid": row.appid,
-                "name": row.name,
-                "name_zh": row.name_zh,
-            })
+            storage.upsert_item(
+                {
+                    "smis_id": row.smis_id,
+                    "item_key": row.item_key,
+                    "appid": row.appid,
+                    "name": row.name,
+                    "name_zh": row.name_zh,
+                }
+            )
             storage.save_snapshots(history(row))
             storage.mark_recommendation_cache_fetched(
                 row.item_key,

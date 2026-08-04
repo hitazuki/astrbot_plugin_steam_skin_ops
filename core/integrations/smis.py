@@ -100,11 +100,13 @@ class SmisClient:
         self._clock = time.monotonic
         self._sleep = time.sleep
         if session is not None and hasattr(self.session, "headers"):
-            self.session.headers.update({
-                "User-Agent": "astrbot-plugin-steam-skin-ops/1.0",
-                "Origin": "https://smis.club",
-                "Referer": "https://smis.club/exchange",
-            })
+            self.session.headers.update(
+                {
+                    "User-Agent": "astrbot-plugin-steam-skin-ops/1.0",
+                    "Origin": "https://smis.club",
+                    "Referer": "https://smis.club/exchange",
+                }
+            )
 
     def build_auth_headers(self, timestamp_ms: int | None = None) -> dict[str, str]:
         timestamp_ms = timestamp_ms or int(time.time() * 1000)
@@ -183,30 +185,20 @@ class SmisClient:
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
                 last_error = exc
             except ValueError as exc:
-                last_error = SmisRetryableError(
-                    f"SMIS 返回内容无法解析: {exc}"
-                )
+                last_error = SmisRetryableError(f"SMIS 返回内容无法解析: {exc}")
             except httpx.HTTPError as exc:
                 last_error = exc
             except SmisClientError:
                 raise
             if attempt + 1 < self.max_retries:
-                retry_after = (
-                    last_error.retry_after
-                    if isinstance(last_error, SmisRetryableError)
-                    else None
-                )
-                self._sleep(
-                    retry_after if retry_after is not None else min(2 ** attempt, 4)
-                )
+                retry_after = last_error.retry_after if isinstance(last_error, SmisRetryableError) else None
+                self._sleep(retry_after if retry_after is not None else min(2**attempt, 4))
         raise SmisClientError(f"SMIS 请求重试耗尽: {last_error}") from last_error
 
     @staticmethod
     def _smis_time(value: str) -> datetime:
         try:
-            local = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=ZoneInfo("Asia/Shanghai")
-            )
+            local = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
             return local.astimezone(timezone.utc)
         except (TypeError, ValueError) as exc:
             raise SmisClientError(f"SMIS 更新时间无效: {value!r}") from exc
@@ -216,16 +208,19 @@ class SmisClient:
         if not isinstance(data, dict):
             raise SmisClientError("SMIS 商品详情结构无效")
         required = {
-            "hashName", "updateTime", "buffSellPrice", "buffSellNum",
-            "steamSellPrice", "steamSellNum", "steamTransactionQuantity",
+            "hashName",
+            "updateTime",
+            "buffSellPrice",
+            "buffSellNum",
+            "steamSellPrice",
+            "steamSellNum",
+            "steamTransactionQuantity",
         }
         missing = sorted(required - data.keys())
         if missing:
             raise SmisClientError(f"SMIS 商品详情缺少字段: {', '.join(missing)}")
         if str(data.get("hashName")) != str(item["name"]):
-            raise SmisClientError(
-                f"SMIS 商品不匹配: 期望 {item['name']}, 实际 {data.get('hashName')}"
-            )
+            raise SmisClientError(f"SMIS 商品不匹配: 期望 {item['name']}, 实际 {data.get('hashName')}")
         snapshot = MarketSnapshot(
             item_key=str(item["item_key"]),
             smis_id=int(item["smis_id"]),
@@ -261,9 +256,7 @@ class SmisClient:
         if missing:
             raise SmisClientError(f"SMIS 商品详情缺少字段: {', '.join(missing)}")
         if int(data["id"]) != int(smis_id):
-            raise SmisClientError(
-                f"SMIS 商品 ID 不匹配: 期望 {smis_id}, 实际 {data.get('id')}"
-            )
+            raise SmisClientError(f"SMIS 商品 ID 不匹配: 期望 {smis_id}, 实际 {data.get('id')}")
         return {
             "smis_id": int(data["id"]),
             "item_key": f"smis:{int(data['id'])}",
@@ -277,9 +270,7 @@ class SmisClient:
         query = str(query).strip()
         if not query:
             return []
-        data = self._request(
-            "POST", "/commodity/suggest", json={"game": game, "text": query}
-        )
+        data = self._request("POST", "/commodity/suggest", json={"game": game, "text": query})
         if not isinstance(data, list):
             raise SmisClientError("SMIS 搜索结果结构无效")
         results: list[dict[str, Any]] = []
@@ -295,11 +286,13 @@ class SmisClient:
             if smis_id <= 0 or not name_zh or smis_id in seen:
                 continue
             seen.add(smis_id)
-            results.append({
-                "smis_id": smis_id,
-                "name_zh": name_zh,
-                "rarity": str(row.get("rarity") or "").strip() or None,
-            })
+            results.append(
+                {
+                    "smis_id": smis_id,
+                    "name_zh": name_zh,
+                    "rarity": str(row.get("rarity") or "").strip() or None,
+                }
+            )
             if len(results) >= max(1, min(int(limit), 20)):
                 break
         return results
@@ -317,9 +310,7 @@ class SmisClient:
         """Fetch the current SMIS platform-to-Steam exchange candidate page."""
 
         page_size = max(1, min(int(limit), 50))
-        time_after = datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(
-            minutes=max(1, int(max_age_minutes))
-        )
+        time_after = datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(minutes=max(1, int(max_age_minutes)))
         payload = {
             "model": 0,
             "platforms": ["buff", "uuyp", "c5", "igxe", "eco"],
@@ -371,9 +362,7 @@ class SmisClient:
                     eco_sell_num=int(row.get("ecoSellNum") or 0),
                     steam_sell_price=float(row.get("steamSellPrice") or 0),
                     steam_sell_num=int(row.get("steamSellNum") or 0),
-                    steam_transaction_quantity=int(
-                        row.get("steamTransactionQuantity") or 0
-                    ),
+                    steam_transaction_quantity=int(row.get("steamTransactionQuantity") or 0),
                     kind="current",
                 )
             except (KeyError, TypeError, ValueError) as exc:
@@ -401,20 +390,22 @@ class SmisClient:
         snapshots: list[MarketSnapshot] = []
         for row in zip(*data):
             observed = datetime.fromtimestamp(float(row[0]) / 1000, timezone.utc)
-            snapshots.append(MarketSnapshot(
-                item_key=str(item["item_key"]),
-                smis_id=int(item["smis_id"]),
-                appid=int(item["appid"]),
-                name=str(item["name"]),
-                name_zh=str(item["name_zh"]),
-                observed_at=observed,
-                source_updated_at=observed,
-                buff_sell_price=float(row[1] or 0),
-                buff_sell_num=int(row[2] or 0),
-                steam_sell_price=float(row[3] or 0),
-                steam_sell_num=int(row[4] or 0),
-                steam_transaction_quantity=int(row[5] or 0),
-                buff_to_steam_ratio=float(row[6]) if row[6] is not None else None,
-                kind="history",
-            ))
+            snapshots.append(
+                MarketSnapshot(
+                    item_key=str(item["item_key"]),
+                    smis_id=int(item["smis_id"]),
+                    appid=int(item["appid"]),
+                    name=str(item["name"]),
+                    name_zh=str(item["name_zh"]),
+                    observed_at=observed,
+                    source_updated_at=observed,
+                    buff_sell_price=float(row[1] or 0),
+                    buff_sell_num=int(row[2] or 0),
+                    steam_sell_price=float(row[3] or 0),
+                    steam_sell_num=int(row[4] or 0),
+                    steam_transaction_quantity=int(row[5] or 0),
+                    buff_to_steam_ratio=float(row[6]) if row[6] is not None else None,
+                    kind="history",
+                )
+            )
         return snapshots

@@ -3,38 +3,40 @@ from __future__ import annotations
 import logging
 import math
 import threading
-import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from urllib.parse import quote
 
 from .alerting import evaluate_rule_transition
 from .candidate_features import (
-    RANKING_POLICY_VERSION,
     build_candidate_record,
     market_observation_digest,
 )
+from .catalog import CatalogService
+from .errors import ServiceError
 from .evaluation import ForecastEvaluationStorage
 from .history import seven_day_history_stats
 from .history_backfill import HistoryBackfiller
 from .integrations.smis import MarketDataProvider
+from .items import item_from_row
 from .market import MAX_SOURCE_FUTURE_SKEW_SECONDS, MarketSnapshot
 from .presentation import (
     daily_analysis_suffix,
     format_breakthrough_alert,
     format_rule_alert,
 )
-from .recommendation import (
-    RecommendationPolicy,
-    dynamic_analysis_limit,
-    final_recommendation_rank_key,
-    rank_recommendations,
-    score_recommendation,
+from .recommendation import RecommendationPolicy
+from .recommendation_service import RecommendationService
+from .repository import MonitorStorage
+from .risk import (
+    FORECAST_MODEL_VERSION,
+    MarketAnalysis,
+    analyze_market,
+    volume_cohort,
 )
-from .repository import MonitorStorage, RuleItemLimitError
-from .risk import FORECAST_MODEL_VERSION, forecast_and_risk, volume_cohort
+from .rule_service import RuleService
 from .rules import (
     MAX_RULE_STATE_INTEGER,
     RuleMeasurement,
@@ -57,25 +59,6 @@ def _positive_finite(value: object) -> float | None:
 
 def _state_count(value: object) -> int:
     return parse_rule_state_integer(value) or 0
-
-
-class ServiceError(RuntimeError):
-    def __init__(self, status_code: int, code: str, message: str, data: object = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.code = code
-        self.message = message
-        self.data = data
-
-
-def item_from_row(row: dict) -> dict:
-    return {
-        "smis_id": int(row["smis_id"]),
-        "item_key": str(row["item_key"]),
-        "appid": int(row["appid"]),
-        "name": str(row["hash_name"]),
-        "name_zh": str(row["cn_name"]),
-    }
 
 
 class MonitoringManager:
@@ -116,8 +99,21 @@ class MonitoringManager:
         self.breakthrough_step = float(breakthrough_step_percent) / 100
         self._locks_guard = threading.Lock()
         self._item_locks: dict[int, threading.Lock] = {}
-        self._recommend_history_rate_lock = threading.Lock()
-        self._recommend_history_requests: deque[float] = deque()
+        self.catalog_service = CatalogService(storage, source)
+        self.rule_service = RuleService(
+            storage,
+            source,
+            self.history_backfiller,
+            max_items=self.max_items,
+        )
+        self.recommendation_service = RecommendationService(
+            storage,
+            source,
+            policy=self.recommendation_policy,
+            poll_interval_seconds=self.poll_interval_seconds,
+            lock_for=self._lock_for,
+            evaluation_storage=evaluation_storage,
+        )
         self._audit_rule_configurations()
         self._audit_rule_states()
         self._sync_t7_rule_basis()
@@ -169,26 +165,18 @@ class MonitoringManager:
         )
         for rule in self.storage.list_rules():
             state = self.storage.get_rule_state(int(rule["id"]))
-            integers = {
-                key: parse_rule_state_integer(state.get(key, 0))
-                for key in integer_fields
-            }
+            integers = {key: parse_rule_state_integer(state.get(key, 0)) for key in integer_fields}
             if any(value is None for value in integers.values()):
                 self._quarantine_rule(rule, "规则状态无效")
                 continue
-            if (
-                integers["alert_active"] not in {0, 1}
-            ):
+            if integers["alert_active"] not in {0, 1}:
                 self._quarantine_rule(rule, "规则状态无效")
                 continue
             numeric_values = (
                 state.get("last_value"),
                 state.get("last_baseline"),
             )
-            if any(
-                value is not None and _positive_finite(value) is None
-                for value in numeric_values
-            ):
+            if any(value is not None and _positive_finite(value) is None for value in numeric_values):
                 self._quarantine_rule(rule, "测量值无效")
 
     def _sync_t7_rule_basis(self) -> None:
@@ -262,10 +250,7 @@ class MonitoringManager:
 
     def list_items(self, recipient_key: str) -> list[dict]:
         result = []
-        active_ids = {
-            int(rule["smis_id"])
-            for rule in self.storage.list_rules(recipient_key=recipient_key)
-        }
+        active_ids = {int(rule["smis_id"]) for rule in self.storage.list_rules(recipient_key=recipient_key)}
         for item in self.storage.list_items():
             if int(item["smis_id"]) not in active_ids:
                 continue
@@ -283,189 +268,7 @@ class MonitoringManager:
         return result
 
     def search_items(self, query: str, limit: int = 10) -> list[dict]:
-        try:
-            return self.source.search_items(query, limit=limit)
-        except Exception as exc:
-            logger.warning("SMIS 搜索失败：%s", exc)
-            raise ServiceError(503, "smis_search_failed", "SMIS 搜索暂时不可用") from exc
-
-    @staticmethod
-    def _recommendation_item(snapshot: MarketSnapshot) -> dict:
-        return {
-            "item_key": str(snapshot.item_key),
-            "smis_id": int(snapshot.smis_id),
-            "appid": int(snapshot.appid),
-            "name": str(snapshot.name),
-            "name_zh": str(snapshot.name_zh),
-        }
-
-    @staticmethod
-    def _parse_utc(value: object) -> datetime | None:
-        if value is None:
-            return None
-        try:
-            parsed = datetime.fromisoformat(str(value))
-        except (TypeError, ValueError):
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-
-    def _recommendation_cache_state(
-        self,
-        snapshot: MarketSnapshot,
-        *,
-        now: datetime,
-    ) -> dict:
-        record = self.storage.recommendation_cache_record(snapshot.item_key)
-        fetched_at = self._parse_utc(record.get("last_fetched_at")) if record else None
-        failed_at = self._parse_utc(record.get("last_failed_at")) if record else None
-        rows = self.storage.market_history_rows(snapshot.item_key, days=30)
-        age_hours = (
-            max(0.0, (now - fetched_at).total_seconds() / 3600)
-            if fetched_at is not None
-            else math.inf
-        )
-        failure_cooldown = bool(
-            failed_at is not None and now - failed_at < timedelta(minutes=30)
-        )
-        if not rows or fetched_at is None:
-            state = "cooldown" if failure_cooldown else "missing"
-        elif age_hours <= 6:
-            state = "fresh"
-        elif age_hours <= 24:
-            state = "usable"
-        else:
-            state = "cooldown" if failure_cooldown else "expired"
-        return {
-            "state": state,
-            "rows": rows,
-            "age_hours": age_hours,
-            "failure_cooldown": failure_cooldown,
-            "record": record,
-        }
-
-    def _claim_recommendation_history_slot(self) -> bool:
-        current = time.monotonic()
-        with self._recommend_history_rate_lock:
-            while (
-                self._recommend_history_requests
-                and current - self._recommend_history_requests[0] >= 60
-            ):
-                self._recommend_history_requests.popleft()
-            if len(self._recommend_history_requests) >= 8:
-                return False
-            self._recommend_history_requests.append(current)
-            return True
-
-    def _fetch_recommendation_history(
-        self,
-        snapshot: MarketSnapshot,
-        policy: RecommendationPolicy,
-        diagnostics: dict,
-        *,
-        refresh: bool,
-    ) -> bool:
-        if diagnostics["history_fetches"] >= policy.history_fetch_budget:
-            return False
-        with self._lock_for(snapshot.smis_id):
-            current = datetime.now(timezone.utc)
-            cached = self._recommendation_cache_state(snapshot, now=current)
-            if cached["failure_cooldown"]:
-                return cached["state"] in {"fresh", "usable"}
-            if refresh:
-                if cached["state"] != "usable":
-                    return cached["state"] == "fresh"
-            elif cached["state"] not in {"missing", "expired"}:
-                return cached["state"] in {"fresh", "usable"}
-            if not self._claim_recommendation_history_slot():
-                diagnostics["rate_limited"] += 1
-                return False
-            diagnostics["history_fetches"] += 1
-            started = time.monotonic()
-            item = self._recommendation_item(snapshot)
-            try:
-                snapshots = self.source.fetch_history(item, 30)
-                if not snapshots:
-                    raise RuntimeError("SMIS 历史数据为空")
-                self.storage.save_snapshots(snapshots)
-                self.storage.mark_recommendation_cache_fetched(
-                    snapshot.item_key,
-                    snapshot.smis_id,
-                    snapshot.appid,
-                    at=current,
-                )
-                if refresh:
-                    diagnostics["history_refreshes"] += 1
-                return True
-            except Exception as exc:
-                diagnostics["history_failures"] += 1
-                self.storage.mark_recommendation_cache_failed(
-                    snapshot.item_key,
-                    snapshot.smis_id,
-                    snapshot.appid,
-                    at=current,
-                )
-                logger.warning(
-                    "推荐历史获取失败 smis_id=%s: %s",
-                    snapshot.smis_id,
-                    exc,
-                )
-                return False
-            finally:
-                diagnostics["history_seconds"] += time.monotonic() - started
-
-    def _score_recommendation_candidate(
-        self,
-        snapshot: MarketSnapshot,
-        row: dict,
-        policy: RecommendationPolicy,
-        *,
-        now: datetime,
-    ) -> dict | None:
-        cached = self._recommendation_cache_state(snapshot, now=now)
-        if cached["state"] not in {"fresh", "usable"}:
-            return None
-        self.storage.mark_recommendation_cache_used(
-            snapshot.item_key,
-            snapshot.smis_id,
-            snapshot.appid,
-            at=now,
-        )
-        stats = seven_day_history_stats(
-            self.storage.steam_history(
-                snapshot.item_key,
-                days=7,
-                max_current_lag_seconds=self.poll_interval_seconds,
-            )
-        )
-        pooled = self._pooled_residuals(snapshot)
-        forecast, risk = forecast_and_risk(
-            cached["rows"],
-            snapshot,
-            stats,
-            max_current_lag_seconds=self.poll_interval_seconds,
-            pooled_residuals_by_mode=pooled,
-        )
-        scored = score_recommendation(
-            row,
-            forecast,
-            risk,
-            policy,
-            history_age_hours=float(cached["age_hours"]),
-        )
-        if scored is not None:
-            scored["volume_cohort"] = volume_cohort(
-                snapshot.steam_transaction_quantity
-            )
-            scored["recommendation_candidate"] = build_candidate_record(
-                snapshot,
-                cached["rows"],
-                forecast,
-                risk,
-                ranking={**scored, "instant_balance_ratio": row.get("ratio")},
-            )
-        return scored
+        return self.catalog_service.search_items(query, limit)
 
     def recommend(
         self,
@@ -473,315 +276,49 @@ class MonitoringManager:
         min_price: float | None = None,
         min_steam_volume: int | None = None,
     ) -> dict:
-        started = time.monotonic()
-        try:
-            policy = self.recommendation_policy.with_overrides(
-                max_price=max_price,
-                min_price=min_price,
-                min_steam_volume=min_steam_volume,
-            )
-        except ValueError as exc:
-            raise ServiceError(422, "invalid_recommendation_filter", str(exc)) from exc
-        try:
-            snapshots = self.source.fetch_exchange_candidates(
-                min_price=policy.min_price,
-                max_price=policy.max_price,
-                min_transaction_quantity=policy.min_steam_volume,
-                max_ratio=policy.max_ratio,
-                max_age_minutes=policy.max_source_age_minutes,
-                limit=policy.candidate_limit,
-            )
-        except Exception as exc:
-            logger.warning("SMIS 挂刀候选查询失败：%s", exc)
-            raise ServiceError(
-                503,
-                "recommendation_source_unavailable",
-                "SMIS 挂刀候选暂时不可用",
-            ) from exc
-        instant = rank_recommendations(
-            snapshots,
-            policy,
-            limit=policy.candidate_limit,
+        return self.recommendation_service.recommend(
+            max_price,
+            min_price,
+            min_steam_volume,
         )
-        pool_limit = dynamic_analysis_limit(instant["recommendations"], policy)
-        rows = instant["recommendations"][:pool_limit]
-        snapshot_by_id = {int(row.smis_id): row for row in snapshots}
-        pool = [
-            (snapshot_by_id[int(row["smis_id"])], row)
-            for row in rows
-            if int(row["smis_id"]) in snapshot_by_id
-        ]
-        now = datetime.now(timezone.utc)
-        initial_states = {
-            int(snapshot.smis_id): self._recommendation_cache_state(snapshot, now=now)
-            for snapshot, _ in pool
-        }
-        diagnostics = {
-            "cache_hits": sum(
-                state["state"] in {"fresh", "usable"}
-                for state in initial_states.values()
-            ),
-            "history_fetches": 0,
-            "history_refreshes": 0,
-            "history_failures": 0,
-            "history_skipped": 0,
-            "rate_limited": 0,
-            "history_seconds": 0.0,
-        }
 
-        for snapshot, _ in pool:
-            state = initial_states[int(snapshot.smis_id)]["state"]
-            if state in {"missing", "expired"}:
-                self._fetch_recommendation_history(
-                    snapshot,
-                    policy,
-                    diagnostics,
-                    refresh=False,
-                )
-
-        scored = [
-            candidate
-            for snapshot, row in pool
-            if (
-                candidate := self._score_recommendation_candidate(
-                    snapshot,
-                    row,
-                    policy,
-                    now=datetime.now(timezone.utc),
-                )
-            )
-            is not None
-        ]
-
-        stale_pool = [
-            snapshot
-            for snapshot, _ in pool
-            if self._recommendation_cache_state(
-                snapshot,
-                now=datetime.now(timezone.utc),
-            )["state"] == "usable"
-        ]
-        refresh_candidates = (
-            stale_pool[:2] if len(scored) >= policy.result_limit else []
-        )
-        for snapshot in refresh_candidates:
-            self._fetch_recommendation_history(
-                snapshot,
-                policy,
-                diagnostics,
-                refresh=True,
-            )
-
-        if diagnostics["history_refreshes"]:
-            scored = [
-                candidate
-                for snapshot, row in pool
-                if (
-                    candidate := self._score_recommendation_candidate(
-                        snapshot,
-                        row,
-                        policy,
-                        now=datetime.now(timezone.utc),
-                    )
-                )
-                is not None
-            ]
-
-        diagnostics["history_skipped"] = sum(
-            self._recommendation_cache_state(
-                snapshot,
-                now=datetime.now(timezone.utc),
-            )["state"]
-            not in {"fresh", "usable"}
-            for snapshot, _ in pool
-        )
-        scored.sort(key=final_recommendation_rank_key)
-        diagnostics["history_seconds"] = round(diagnostics["history_seconds"], 3)
-        diagnostics["total_seconds"] = round(time.monotonic() - started, 3)
-        logger.info(
-            "推荐完成 scanned=%s eligible=%s pool=%s ready=%s cache_hits=%s "
-            "history_fetches=%s refreshes=%s skipped=%s duration=%.3fs",
-            instant["scanned_count"],
-            instant["eligible_count"],
-            len(pool),
-            len(scored),
-            diagnostics["cache_hits"],
-            diagnostics["history_fetches"],
-            diagnostics["history_refreshes"],
-            diagnostics["history_skipped"],
-            diagnostics["total_seconds"],
-        )
-        return {
-            **instant,
-            "recommendations": scored[: policy.result_limit],
-            "analysis_pool_count": len(pool),
-            "analyzed_count": len(scored),
-            "strategy": RANKING_POLICY_VERSION,
-            "candidate_records": [
-                row["recommendation_candidate"]
-                for row in scored[: policy.result_limit]
-            ],
-            "diagnostics": diagnostics,
-        }
-
-    @staticmethod
-    def _validate_rule(rule_type: str, threshold: float) -> None:
-        error = validate_rule(rule_type, threshold)
-        if error:
-            raise ServiceError(422, error[0], error[1])
-
-    def list_rules(self, recipient_key: str, smis_id: int | None = None) -> list[dict]:
-        rows = self.storage.list_rules(recipient_key=recipient_key, smis_id=smis_id)
-        for row in rows:
-            row["state"] = self.storage.get_rule_state(row["id"])
-        return rows
+    def list_rules(
+        self,
+        recipient_key: str,
+        smis_id: int | None = None,
+    ) -> list[dict]:
+        return self.rule_service.list_rules(recipient_key, smis_id)
 
     def add_rule(
-        self, recipient_key: str, smis_id: int, rule_type: str, threshold: float
+        self,
+        recipient_key: str,
+        smis_id: int,
+        rule_type: str,
+        threshold: float,
     ) -> dict:
-        rule_type = rule_type.strip().lower()
-        self._validate_rule(rule_type, threshold)
-        if (
-            not self.storage.list_rules(smis_id=smis_id, operational_only=True)
-            and self.storage.count_rule_items() >= self.max_items
-        ):
-            raise ServiceError(409, "item_limit", f"最多只能监控 {self.max_items} 个饰品")
-        item = self.storage.get_item(smis_id)
-        if item is None:
-            try:
-                metadata = self.source.fetch_metadata(smis_id)
-            except Exception as exc:
-                raise ServiceError(503, "source_unavailable", f"SMIS 饰品信息获取失败：{exc}") from exc
-            item = self.storage.upsert_item(metadata)
-        try:
-            rule = self.storage.add_rule(
-                smis_id,
-                recipient_key,
-                rule_type,
-                threshold,
-                max_items=self.max_items,
-            )
-        except RuleItemLimitError as exc:
-            self.storage.delete_item_if_unreferenced(smis_id)
-            raise ServiceError(
-                409,
-                "item_limit",
-                f"最多只能监控 {self.max_items} 个饰品",
-            ) from exc
-        try:
-            self.history_backfiller.ensure_history(item_from_row(item))
-        except Exception as exc:
-            logger.warning("规则历史回填失败 smis_id=%s: %s", smis_id, exc)
-        rule["state"] = self.storage.get_rule_state(rule["id"])
-        return rule
+        return self.rule_service.add_rule(
+            recipient_key,
+            smis_id,
+            rule_type,
+            threshold,
+        )
 
-    def update_rule(self, recipient_key: str, rule_id: int, threshold: float) -> dict:
-        rule = self.storage.get_rule(rule_id)
-        if not rule or str(rule["recipient_key"]) != recipient_key:
-            raise ServiceError(404, "rule_not_found", "当前会话未找到该规则")
-        self._validate_rule(str(rule["rule_type"]), threshold)
-        try:
-            return self.storage.update_rule(
-                rule_id,
-                recipient_key,
-                threshold,
-                max_items=self.max_items,
-            )
-        except RuleItemLimitError as exc:
-            raise ServiceError(
-                409,
-                "item_limit",
-                f"最多只能监控 {self.max_items} 个饰品",
-            ) from exc
+    def update_rule(
+        self,
+        recipient_key: str,
+        rule_id: int,
+        threshold: float,
+    ) -> dict:
+        return self.rule_service.update_rule(recipient_key, rule_id, threshold)
 
     def remove_rule(self, recipient_key: str, rule_id: int) -> None:
-        if not self.storage.delete_rule(rule_id, recipient_key):
-            raise ServiceError(404, "rule_not_found", "当前会话未找到该规则")
-
-    def _resolve_local_item(self, query: str) -> dict | None:
-        matches = self.storage.resolve_items(query)
-        if not matches:
-            return None
-        if query.isdigit():
-            return matches[0]
-        exact = [
-            row for row in matches
-            if query.casefold() in {str(row["hash_name"]).casefold(), str(row["cn_name"]).casefold()}
-        ]
-        if len(exact) == 1:
-            return exact[0]
-        return None
-
-    def _market_candidates(self, query: str) -> list[dict]:
-        matches = self.search_items(query, limit=10)
-        exact = [
-            row for row in matches
-            if str(row.get("name_zh") or "").casefold() == query.casefold()
-        ]
-        return exact if exact else matches
+        self.rule_service.remove_rule(recipient_key, rule_id)
 
     def resolve_smis_id(self, query: str) -> int:
-        """Resolve command input through the same catalog matching policy as quotes."""
-
-        target = query.strip()
-        if target.isdigit():
-            return int(target)
-        candidates = self._market_candidates(target)
-        if not candidates:
-            raise ServiceError(
-                404,
-                "item_not_found",
-                "SMIS 未找到匹配饰品，请先使用 /skin search。",
-            )
-        if len(candidates) > 1:
-            raise ServiceError(
-                409,
-                "ambiguous_item",
-                "名称匹配到多个饰品，请改用 SMIS ID",
-                candidates,
-            )
-        return int(candidates[0]["smis_id"])
-
-    def _resolve_market_item(self, query: str) -> dict:
-        try:
-            if query.isdigit():
-                metadata = self.source.fetch_metadata(int(query))
-            else:
-                candidates = self._market_candidates(query)
-                if not candidates:
-                    raise ServiceError(
-                        404, "item_not_found", "SMIS 全市场未找到匹配饰品"
-                    )
-                if len(candidates) > 1:
-                    raise ServiceError(
-                        409,
-                        "ambiguous_item",
-                        "名称匹配到多个饰品，请使用 SMIS ID 查询",
-                        candidates,
-                    )
-                metadata = self.source.fetch_metadata(int(candidates[0]["smis_id"]))
-        except ServiceError:
-            raise
-        except Exception as exc:
-            logger.warning("SMIS 全市场饰品解析失败：%s", exc)
-            raise ServiceError(
-                503, "source_unavailable", f"SMIS 饰品信息获取失败：{exc}"
-            ) from exc
-        return {
-            "smis_id": int(metadata["smis_id"]),
-            "item_key": str(metadata["item_key"]),
-            "appid": int(metadata["appid"]),
-            "hash_name": str(metadata["name"]),
-            "cn_name": str(metadata["name_zh"]),
-        }
-
-    def _resolve_quote_item(self, query: str) -> dict:
-        query = query.strip()
-        local = self._resolve_local_item(query)
-        return local if local is not None else self._resolve_market_item(query)
+        return self.catalog_service.resolve_smis_id(query)
 
     def quote(self, query: str) -> dict:
-        item_row = self._resolve_quote_item(query)
+        item_row = self.catalog_service.resolve_quote_item(query)
         item = item_from_row(item_row)
         bootstrap_status: bool | None = False
         try:
@@ -809,7 +346,9 @@ class MonitoringManager:
                 if bootstrap_status is False:
                     try:
                         self.history_backfiller.backfill_changed_gap(
-                            item, latest, snapshot,
+                            item,
+                            latest,
+                            snapshot,
                             self.storage.list_rules(
                                 smis_id=item["smis_id"],
                                 operational_only=True,
@@ -818,7 +357,8 @@ class MonitoringManager:
                     except Exception as exc:
                         logger.warning(
                             "报价缺口历史回填失败 smis_id=%s: %s",
-                            item["smis_id"], exc,
+                            item["smis_id"],
+                            exc,
                         )
                 self.storage.save_snapshots([snapshot])
                 row = self._snapshot_to_row(snapshot)
@@ -845,7 +385,10 @@ class MonitoringManager:
                             item["smis_id"],
                             cache_exc,
                         )
-                raise ServiceError(503, "source_unavailable", f"行情获取失败：{exc}") from exc
+                raise ServiceError(
+                    "source_unavailable",
+                    f"行情获取失败：{exc}",
+                ) from exc
 
     def _cached_quote_payload(
         self,
@@ -897,29 +440,35 @@ class MonitoringManager:
         )
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
-        age_seconds = (
-            datetime.now(timezone.utc) - value.astimezone(timezone.utc)
-        ).total_seconds()
-        return (
-            age_seconds < -MAX_SOURCE_FUTURE_SKEW_SECONDS
-            or age_seconds > self.poll_interval_seconds
-        )
+        age_seconds = (datetime.now(timezone.utc) - value.astimezone(timezone.utc)).total_seconds()
+        return age_seconds < -MAX_SOURCE_FUTURE_SKEW_SECONDS or age_seconds > self.poll_interval_seconds
 
     @staticmethod
     def _snapshot_from_row(row: dict) -> MarketSnapshot:
         return MarketSnapshot(
-            item_key=row["item_key"], smis_id=row["smis_id"], appid=row["appid"],
-            name=row["name"], name_zh=row["name_zh"],
+            item_key=row["item_key"],
+            smis_id=row["smis_id"],
+            appid=row["appid"],
+            name=row["name"],
+            name_zh=row["name_zh"],
             observed_at=datetime.fromisoformat(row["observed_at"]),
             source_updated_at=datetime.fromisoformat(row["source_updated_at"]),
-            buff_sell_price=row["buff_sell_price"], buff_sell_num=row["buff_sell_num"],
-            uuyp_sell_price=row.get("uuyp_sell_price"), uuyp_sell_num=row.get("uuyp_sell_num"),
-            c5_sell_price=row.get("c5_sell_price"), c5_sell_num=row.get("c5_sell_num"),
-            igxe_sell_price=row.get("igxe_sell_price"), igxe_sell_num=row.get("igxe_sell_num"),
-            eco_sell_price=row.get("eco_sell_price"), eco_sell_num=row.get("eco_sell_num"),
-            steam_sell_price=row["steam_sell_price"], steam_sell_num=row["steam_sell_num"],
+            buff_sell_price=row["buff_sell_price"],
+            buff_sell_num=row["buff_sell_num"],
+            uuyp_sell_price=row.get("uuyp_sell_price"),
+            uuyp_sell_num=row.get("uuyp_sell_num"),
+            c5_sell_price=row.get("c5_sell_price"),
+            c5_sell_num=row.get("c5_sell_num"),
+            igxe_sell_price=row.get("igxe_sell_price"),
+            igxe_sell_num=row.get("igxe_sell_num"),
+            eco_sell_price=row.get("eco_sell_price"),
+            eco_sell_num=row.get("eco_sell_num"),
+            steam_sell_price=row["steam_sell_price"],
+            steam_sell_num=row["steam_sell_num"],
             steam_transaction_quantity=row["steam_transaction_quantity"],
-            buff_to_steam_ratio=row["buff_to_steam_ratio"], kind=row["kind"], source=row["source"],
+            buff_to_steam_ratio=row["buff_to_steam_ratio"],
+            kind=row["kind"],
+            source=row["source"],
         )
 
     @classmethod
@@ -948,8 +497,7 @@ class MonitoringManager:
                 for name, price, count in snapshot.platform_quotes
             ],
             "lowest_platform": (
-                {"name": lowest[0], "sell_price": lowest[1], "sell_num": lowest[2]}
-                if lowest else None
+                {"name": lowest[0], "sell_price": lowest[1], "sell_num": lowest[2]} if lowest else None
             ),
         }
 
@@ -957,18 +505,22 @@ class MonitoringManager:
         snapshot_object = self._snapshot_from_row(row)
         snapshot = self._snapshot_row_to_dict(row)
         stats = self._seven_day_history_stats(str(item["item_key"]))
-        forecast, risk = self._forecast_and_risk(
-            str(item["item_key"]), snapshot_object, stats, stale=stale
-        )
-        history_rows = self.storage.market_history_rows(str(item["item_key"]), days=30)
+        analysis = self._analyze_market(str(item["item_key"]), snapshot_object, stale=stale)
         candidate_record = build_candidate_record(
-            snapshot_object, history_rows, forecast, risk
+            snapshot_object,
+            analysis,
         )
         return {
-            "smis_id": int(item["smis_id"]), "appid": int(item["appid"]),
-            "name": item["hash_name"], "name_zh": item["cn_name"],
-            **snapshot, **stats, "forecast": forecast, "risk_assessment": risk,
-            "cached": cached, "stale": stale,
+            "smis_id": int(item["smis_id"]),
+            "appid": int(item["appid"]),
+            "name": item["hash_name"],
+            "name_zh": item["cn_name"],
+            **snapshot,
+            **stats,
+            "forecast": analysis.forecast,
+            "risk_assessment": analysis.risk,
+            "cached": cached,
+            "stale": stale,
             "recommendation_candidate": candidate_record,
             "links": {
                 "smis": f"https://smis.club/commodity/{int(item['smis_id'])}",
@@ -985,14 +537,18 @@ class MonitoringManager:
             )
         )
 
-    def _forecast_and_risk(
-        self, item_key: str, snapshot: MarketSnapshot, stats: dict, *, stale: bool = False,
-    ) -> tuple[dict, dict]:
-        rows = self.storage.market_history_rows(item_key, days=30)
-        return forecast_and_risk(
-            rows,
+    def _analyze_market(
+        self,
+        item_key: str,
+        snapshot: MarketSnapshot,
+        *,
+        stale: bool = False,
+        rows: list[dict] | None = None,
+    ) -> MarketAnalysis:
+        history_rows = rows if rows is not None else self.storage.market_history_rows(item_key, days=30)
+        return analyze_market(
+            history_rows,
             snapshot,
-            stats,
             stale=stale,
             max_current_lag_seconds=self.poll_interval_seconds,
             pooled_residuals_by_mode=self._pooled_residuals(snapshot),
@@ -1001,9 +557,7 @@ class MonitoringManager:
     def _pooled_residuals(self, snapshot: MarketSnapshot) -> dict[str, list[float]]:
         if self.evaluation_storage is None:
             return {}
-        return self.evaluation_storage.pooled_residuals(
-            volume_cohort(snapshot.steam_transaction_quantity)
-        )
+        return self.evaluation_storage.pooled_residuals(volume_cohort(snapshot.steam_transaction_quantity))
 
     def monitor_item(self, item_row: dict) -> dict:
         item = item_from_row(item_row)
@@ -1041,12 +595,12 @@ class MonitoringManager:
         self._handle_item_recovery(item, rules, snapshot)
         stats = self._seven_day_history_stats(item["item_key"])
         stale = self._source_snapshot_stale(snapshot)
-        forecast, risk = self._forecast_and_risk(
+        analysis = self._analyze_market(
             item["item_key"],
             snapshot,
-            stats,
             stale=stale,
         )
+        forecast, risk = analysis.forecast, analysis.risk
         if self.evaluation_storage is not None:
             self.evaluation_storage.resolve(snapshot, stale=stale)
             self.evaluation_storage.mark_missed(snapshot.observed_at)
@@ -1063,8 +617,14 @@ class MonitoringManager:
         return {"smis_id": item["smis_id"], "success": True, "stale": stale}
 
     def _evaluate_rule(
-        self, snapshot: MarketSnapshot, stats: dict, forecast: dict,
-        risk: dict, rule: dict, *, unavailable_status: str | None = None,
+        self,
+        snapshot: MarketSnapshot,
+        stats: dict,
+        forecast: dict,
+        risk: dict,
+        rule: dict,
+        *,
+        unavailable_status: str | None = None,
     ) -> None:
         rule_id = int(rule["id"])
         rule_type = str(rule["rule_type"])
@@ -1097,6 +657,7 @@ class MonitoringManager:
         if transition.changes.get("status") == "规则状态无效":
             self._quarantine_rule(rule, "规则状态无效")
             return
+        notification = None
         if transition.signal is not None:
             signal = transition.signal
             if signal.style == "breakthrough":
@@ -1111,19 +672,24 @@ class MonitoringManager:
                     signal.level,
                 )
             else:
-                title, content = format_rule_alert(
-                    snapshot, stats, forecast, risk, rule, signal.value
-                )
-            self.storage.enqueue_notification(
-                signal.signal_key,
-                str(rule["recipient_key"]),
-                signal.event_type,
-                title,
-                content,
-                driver=self.delivery_driver,
-                rule_id=rule_id,
-            )
-        self.storage.update_rule_state(rule_id, **transition.changes)
+                title, content = format_rule_alert(snapshot, stats, forecast, risk, rule, signal.value)
+            notification = {
+                "signal_key": signal.signal_key,
+                "event_type": signal.event_type,
+                "title": title,
+                "content": content,
+                "driver": self.delivery_driver,
+            }
+        committed = self.storage.apply_rule_transition(
+            rule_id,
+            str(rule["recipient_key"]),
+            expected_rule_updated_at=str(rule["updated_at"]),
+            expected_state_updated_at=state.get("updated_at"),
+            changes=transition.changes,
+            notification=notification,
+        )
+        if not committed:
+            logger.info("忽略已过期的规则评估 rule_id=%s", rule_id)
 
     def enqueue_daily_summary(self, summary_date: date) -> int:
         date_text = summary_date.isoformat()
@@ -1142,8 +708,7 @@ class MonitoringManager:
                 try:
                     item_freshness[item_key] = bool(
                         latest
-                        and self._snapshot_age_seconds(latest)
-                        <= self.poll_interval_seconds * 2
+                        and self._snapshot_age_seconds(latest) <= self.poll_interval_seconds * 2
                         and not self._source_snapshot_stale(latest)
                     )
                 except Exception as exc:
@@ -1188,7 +753,7 @@ class MonitoringManager:
             grouped[str(rule["recipient_key"])].append((rule, state, level, depth))
 
         queued = 0
-        analysis_cache: dict[str, tuple[dict, dict]] = {}
+        analysis_cache: dict[str, MarketAnalysis] = {}
         for recipient_key, entries in sorted(grouped.items()):
             lines = [f"当前仍满足条件的交易告警共 {len(entries)} 条："]
             for rule, state, level, depth in entries:
@@ -1209,29 +774,39 @@ class MonitoringManager:
                     latest = self.storage.latest_snapshot(item_key)
                     if latest:
                         snapshot = self._snapshot_from_row(latest)
-                        stats = self._seven_day_history_stats(item_key)
-                        stale = (
-                            self._snapshot_age_seconds(latest)
-                            > self.poll_interval_seconds * 2
-                            or self._source_snapshot_stale(latest)
-                        )
-                        analysis_cache[item_key] = self._forecast_and_risk(
-                            item_key, snapshot, stats, stale=stale
+                        stale = self._snapshot_age_seconds(
+                            latest
+                        ) > self.poll_interval_seconds * 2 or self._source_snapshot_stale(latest)
+                        analysis_cache[item_key] = self._analyze_market(
+                            item_key,
+                            snapshot,
+                            stale=stale,
                         )
                     else:
                         unavailable = {"status": "unavailable"}
-                        analysis_cache[item_key] = (unavailable, unavailable)
-                forecast, risk = analysis_cache[item_key]
+                        analysis_cache[item_key] = MarketAnalysis(
+                            unavailable,
+                            unavailable,
+                            [],
+                            [],
+                        )
+                analysis = analysis_cache[item_key]
+                forecast, risk = analysis.forecast, analysis.risk
                 analysis_suffix = daily_analysis_suffix(forecast, risk)
                 lines.append(
                     f"#{int(rule['id'])} {rule['cn_name']} · {definition.daily_label} "
                     f"{values} · 第 {level} 档（{depth:.2%}）{analysis_suffix}"
                 )
-            queued += int(self.storage.enqueue_notification(
-                f"daily-summary:{date_text}", recipient_key, "daily_summary",
-                f"【每日交易告警汇总】{date_text}", "\n".join(lines),
-                driver=self.delivery_driver,
-            ))
+            queued += int(
+                self.storage.enqueue_notification(
+                    f"daily-summary:{date_text}",
+                    recipient_key,
+                    "daily_summary",
+                    f"【每日交易告警汇总】{date_text}",
+                    "\n".join(lines),
+                    driver=self.delivery_driver,
+                )
+            )
         self.storage.set_metadata(key, date_text)
         return queued
 
@@ -1249,21 +824,20 @@ class MonitoringManager:
             if not latest:
                 continue
             snapshot = self._snapshot_from_row(latest)
-            stale = (
-                self._snapshot_age_seconds(latest) > self.poll_interval_seconds * 2
-                or self._source_snapshot_stale(latest)
+            stale = self._snapshot_age_seconds(latest) > self.poll_interval_seconds * 2 or self._source_snapshot_stale(
+                latest
             )
-            stats = self._seven_day_history_stats(item_key)
-            forecast, risk = self._forecast_and_risk(
-                item_key, snapshot, stats, stale=stale
+            analysis = self._analyze_market(
+                item_key,
+                snapshot,
+                stale=stale,
             )
-            rows = self.storage.market_history_rows(item_key, days=30)
             issued += int(
                 self.evaluation_storage.issue(
                     snapshot,
-                    forecast,
+                    analysis.forecast,
                     issue_date=issue_date,
-                    source_digest=market_observation_digest(snapshot, rows),
+                    source_digest=market_observation_digest(snapshot, analysis),
                 )
             )
         return issued
@@ -1279,15 +853,18 @@ class MonitoringManager:
             if failures >= self.health_failure_threshold and not alerted:
                 self.storage.enqueue_notification(
                     f"health:{item['item_key']}:{recipient_key}:down:{failures}",
-                    recipient_key, "health_down",
+                    recipient_key,
+                    "health_down",
                     f"【监控异常】{item['name_zh']}",
                     f"SMIS 行情连续 {failures} 轮请求失败：{exc}",
                     driver=self.delivery_driver,
                 )
                 alerted = 1
             self.storage.update_health_state(
-                item["smis_id"], recipient_key,
-                fetch_failures=failures, health_alerted=alerted,
+                item["smis_id"],
+                recipient_key,
+                fetch_failures=failures,
+                health_alerted=alerted,
             )
 
     def _handle_item_recovery(self, item: dict, rules: list[dict], snapshot: MarketSnapshot) -> None:
@@ -1295,25 +872,18 @@ class MonitoringManager:
             state = self.storage.get_health_state(item["smis_id"], recipient_key)
             if _state_count(state.get("health_alerted")):
                 self.storage.enqueue_notification(
-                    f"health:{item['item_key']}:{recipient_key}:recovered:"
-                    f"{snapshot.observed_at.isoformat()}",
-                    recipient_key, "health_recovered", f"【监控恢复】{item['name_zh']}",
+                    f"health:{item['item_key']}:{recipient_key}:recovered:{snapshot.observed_at.isoformat()}",
+                    recipient_key,
+                    "health_recovered",
+                    f"【监控恢复】{item['name_zh']}",
                     "SMIS 行情请求已恢复。",
                     driver=self.delivery_driver,
                 )
-            self.storage.update_health_state(
-                item["smis_id"], recipient_key, fetch_failures=0, health_alerted=0
-            )
+            self.storage.update_health_state(item["smis_id"], recipient_key, fetch_failures=0, health_alerted=0)
 
     def run_cycle(self, max_workers: int = 4) -> list[dict]:
-        active_ids = {
-            int(rule["smis_id"])
-            for rule in self.storage.list_rules(operational_only=True)
-        }
-        items = [
-            item for item in self.storage.list_items(enabled_only=True)
-            if int(item["smis_id"]) in active_ids
-        ]
+        active_ids = {int(rule["smis_id"]) for rule in self.storage.list_rules(operational_only=True)}
+        items = [item for item in self.storage.list_items(enabled_only=True) if int(item["smis_id"]) in active_ids]
         results: list[dict] = []
         if items:
             with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as executor:
@@ -1329,7 +899,9 @@ class MonitoringManager:
     def test_event(self, recipient_key: str) -> dict:
         now = datetime.now().astimezone()
         self.storage.enqueue_notification(
-            f"test:{recipient_key}:{now.isoformat()}", recipient_key, "test",
+            f"test:{recipient_key}:{now.isoformat()}",
+            recipient_key,
+            "test",
             "【Steam Skin Ops】告警测试",
             f"服务链路正常。\n测试时间：{now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
             driver=self.delivery_driver,

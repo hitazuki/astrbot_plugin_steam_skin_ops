@@ -164,8 +164,11 @@ Top 5 为控制体积提供每项最近 14 日；单品任务移除不适用的�
 
 ```bash
 python -m pip install -e ".[dev]"
-python -m unittest discover -s tests -v
 ruff check .
+ruff format --check .
+python -m mypy
+python -m coverage run -m unittest discover -s tests -v
+python -m coverage report
 python -m compileall -q main.py core
 python scripts/validate_market_package.py
 ```

@@ -10,10 +10,11 @@ from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .core.config import ConfigError, PluginSettings, load_settings
+from .core.errors import ServiceError
 from .core.evaluation import ForecastEvaluationStorage
 from .core.integrations.smis import SmisClient
 from .core.llm_analysis import LlmAnalysisError, LlmAnalysisService
-from .core.manager import MonitoringManager, ServiceError
+from .core.manager import MonitoringManager
 from .core.presentation import format_quote, format_recommendations
 from .core.recommendation import RecommendationPolicy
 from .core.repository import MonitorStorage
@@ -66,9 +67,7 @@ class SteamSkinOpsPlugin(Star):
             min_request_interval=self.settings.smis_min_request_interval_seconds,
         )
         self.storage = MonitorStorage(data_dir / "monitor.db")
-        self.evaluation_storage = ForecastEvaluationStorage(
-            data_dir / "forecast_evaluation.db"
-        )
+        self.evaluation_storage = ForecastEvaluationStorage(data_dir / "forecast_evaluation.db")
         self.manager = MonitoringManager(
             self.storage,
             self.source,
@@ -106,17 +105,13 @@ class SteamSkinOpsPlugin(Star):
 
     def _require_manager(self) -> MonitoringManager:
         if self.manager is None:
-            raise ServiceError(
-                503, "invalid_config", "插件配置无效：" + "；".join(self.config_errors)
-            )
+            raise ServiceError("invalid_config", "插件配置无效：" + "；".join(self.config_errors))
         return self.manager
 
     async def _call(self, func, *args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
 
-    async def _generate_analysis(
-        self, provider_id: str, prompt: str, system_prompt: str
-    ) -> str:
+    async def _generate_analysis(self, provider_id: str, prompt: str, system_prompt: str) -> str:
         response = await self.context.llm_generate(
             chat_provider_id=provider_id,
             prompt=prompt,
@@ -138,9 +133,7 @@ class SteamSkinOpsPlugin(Star):
         if self.llm_analysis is None:
             raise LlmAnalysisError("AI 分析服务不可用")
         try:
-            provider_id = await self.context.get_current_chat_provider_id(
-                umo=event.unified_msg_origin
-            )
+            provider_id = await self.context.get_current_chat_provider_id(umo=event.unified_msg_origin)
         except Exception as exc:
             raise LlmAnalysisError("当前会话未配置可用 AI Provider") from exc
         if not provider_id:
@@ -168,9 +161,7 @@ class SteamSkinOpsPlugin(Star):
             messages = await self._call(self.storage.due_notifications)
             for message in messages:
                 try:
-                    chain = MessageChain().message(
-                        f"{message['title']}\n{message['content']}"
-                    )
+                    chain = MessageChain().message(f"{message['title']}\n{message['content']}")
                     await self.context.send_message(message["recipient_key"], chain)
                 except asyncio.CancelledError:
                     raise
@@ -183,9 +174,7 @@ class SteamSkinOpsPlugin(Star):
                     failed += 1
                     logger.warning("Steam Skin Ops 主动消息发送失败：%s", exc)
                 else:
-                    await self._call(
-                        self.storage.mark_notification_sent, message["id"]
-                    )
+                    await self._call(self.storage.mark_notification_sent, message["id"])
                     sent += 1
             return {"sent": sent, "failed": failed}
 
@@ -204,10 +193,6 @@ class SteamSkinOpsPlugin(Star):
         logger.exception("Steam Skin Ops 命令处理出现未预期异常")
         return "插件内部错误，请查看 AstrBot 日志"
 
-    @staticmethod
-    def _format_quote(data: dict) -> str:
-        return format_quote(data)
-
     @filter.command_group("skin")
     def skin():
         """饰品行情与监控。"""
@@ -218,7 +203,7 @@ class SteamSkinOpsPlugin(Star):
         """即时查询 SMIS 全市场饰品。"""
         try:
             data = await self._call(self._require_manager().quote, query)
-            yield event.plain_result(self._format_quote(data))
+            yield event.plain_result(format_quote(data))
         except Exception as exc:
             yield event.plain_result(f"查询失败：{self._error_text(exc)}")
 
@@ -293,9 +278,7 @@ class SteamSkinOpsPlugin(Star):
                 task="quote_explanation",
                 candidates=[data["recommendation_candidate"]],
             )
-            yield event.plain_result(
-                await self._with_ai_fallback(deterministic, analysis)
-            )
+            yield event.plain_result(await self._with_ai_fallback(deterministic, analysis))
         except Exception as exc:
             yield event.plain_result(f"AI 行情解读失败：{self._error_text(exc)}")
 
@@ -325,9 +308,7 @@ class SteamSkinOpsPlugin(Star):
                 task="recommendation_explanation",
                 candidates=candidates,
             )
-            yield event.plain_result(
-                await self._with_ai_fallback(deterministic, analysis)
-            )
+            yield event.plain_result(await self._with_ai_fallback(deterministic, analysis))
         except Exception as exc:
             yield event.plain_result(f"AI 推荐解读失败：{self._error_text(exc)}")
 
@@ -337,14 +318,17 @@ class SteamSkinOpsPlugin(Star):
         try:
             tokens = [value.strip() for value in smis_ids.replace("，", ",").split(",")]
             if not 2 <= len(tokens) <= 5 or any(not value.isdigit() for value in tokens):
-                raise ServiceError(422, "invalid_compare_items", "请提供 2～5 个逗号分隔的 SMIS ID")
+                raise ServiceError(
+                    "invalid_compare_items",
+                    "请提供 2～5 个逗号分隔的 SMIS ID",
+                )
             ids = [int(value) for value in tokens]
             if len(set(ids)) != len(ids):
-                raise ServiceError(422, "duplicate_compare_items", "比较列表不能包含重复 ID")
-            rows = [
-                await self._call(self._require_manager().quote, str(smis_id))
-                for smis_id in ids
-            ]
+                raise ServiceError(
+                    "duplicate_compare_items",
+                    "比较列表不能包含重复 ID",
+                )
+            rows = [await self._call(self._require_manager().quote, str(smis_id)) for smis_id in ids]
             lines = ["确定性比较（保持输入顺序）："]
             for index, row in enumerate(rows, 1):
                 forecast = row.get("forecast") or {}
@@ -362,9 +346,7 @@ class SteamSkinOpsPlugin(Star):
                 task="comparison",
                 candidates=[row["recommendation_candidate"] for row in rows],
             )
-            yield event.plain_result(
-                await self._with_ai_fallback(deterministic, analysis)
-            )
+            yield event.plain_result(await self._with_ai_fallback(deterministic, analysis))
         except Exception as exc:
             yield event.plain_result(f"AI 比较失败：{self._error_text(exc)}")
 
@@ -379,17 +361,16 @@ class SteamSkinOpsPlugin(Star):
         """解释预测评估聚合指标。"""
         try:
             if days not in {7, 30, 90, 180} or cohort not in {
-                "all", "lt100", "100-999", "1000+",
+                "all",
+                "lt100",
+                "100-999",
+                "1000+",
             }:
                 raise ServiceError(
-                    422,
                     "invalid_evaluation_filter",
-                    "用法：/skin ai eval [7|30|90|180] "
-                    "[all|lt100|100-999|1000+]",
+                    "用法：/skin ai eval [7|30|90|180] [all|lt100|100-999|1000+]",
                 )
-            summary = await self._call(
-                self.evaluation_storage.summary, days=days, cohort=cohort
-            )
+            summary = await self._call(self.evaluation_storage.summary, days=days, cohort=cohort)
             lines = [
                 f"确定性预测评估：最近 {summary['days']} 天 · {summary['cohort_filter']}",
                 f"签发 {summary['issued_count']} · 状态 {summary['status_counts']}",
@@ -407,9 +388,7 @@ class SteamSkinOpsPlugin(Star):
                 task="evaluation_summary",
                 evaluation_summary=summary,
             )
-            yield event.plain_result(
-                await self._with_ai_fallback(deterministic, analysis)
-            )
+            yield event.plain_result(await self._with_ai_fallback(deterministic, analysis))
         except Exception as exc:
             yield event.plain_result(f"AI 评估失败：{self._error_text(exc)}")
 
@@ -423,18 +402,19 @@ class SteamSkinOpsPlugin(Star):
             provider = "不可用"
             if status["enabled"]:
                 try:
-                    provider = await self.context.get_current_chat_provider_id(
-                        umo=event.unified_msg_origin
-                    )
+                    provider = await self.context.get_current_chat_provider_id(umo=event.unified_msg_origin)
                 except Exception:
                     pass
-            yield event.plain_result("\n".join([
-                f"AI 分析启用：{'是' if status['enabled'] else '否'}",
-                f"当前 Provider：{provider}",
-                f"会话剩余额度：{status['remaining']}/{status['limit']}（"
-                f"{status['window_seconds']} 秒窗口）",
-                f"运行计数：{status['stats']}",
-            ]))
+            yield event.plain_result(
+                "\n".join(
+                    [
+                        f"AI 分析启用：{'是' if status['enabled'] else '否'}",
+                        f"当前 Provider：{provider}",
+                        f"会话剩余额度：{status['remaining']}/{status['limit']}（{status['window_seconds']} 秒窗口）",
+                        f"运行计数：{status['stats']}",
+                    ]
+                )
+            )
         except Exception as exc:
             yield event.plain_result(f"AI 状态查询失败：{self._error_text(exc)}")
 
@@ -514,9 +494,7 @@ class SteamSkinOpsPlugin(Star):
                     f"规则已添加：#{data['id']} {data['cn_name']}\n"
                     f"类型：{data['rule_type']} · 阈值：{float(data['threshold']):g}{unit}"
                 )
-            yield event.plain_result(
-                result
-            )
+            yield event.plain_result(result)
         except Exception as exc:
             yield event.plain_result(f"添加失败：{self._error_text(exc)}")
 
@@ -554,12 +532,13 @@ class SteamSkinOpsPlugin(Star):
     async def push_test(self, event: AstrMessageEvent):
         """测试主动推送链路。"""
         try:
-            await self._call(
-                self._require_manager().test_event, event.unified_msg_origin
-            )
+            await self._call(self._require_manager().test_event, event.unified_msg_origin)
             result = await self._dispatch_outbox()
             if not result["sent"]:
-                raise ServiceError(503, "delivery_failed", "主动消息发送失败，请查看 AstrBot 日志")
+                raise ServiceError(
+                    "delivery_failed",
+                    "主动消息发送失败，请查看 AstrBot 日志",
+                )
             yield event.plain_result("主动推送请求已成功执行，请检查当前会话。")
         except Exception as exc:
             yield event.plain_result(f"推送测试失败：{self._error_text(exc)}")
@@ -569,9 +548,7 @@ class SteamSkinOpsPlugin(Star):
     async def service_status(self, event: AstrMessageEvent):
         """查看插件监控状态。"""
         if self.config_errors:
-            yield event.plain_result(
-                "插件配置无效，后台监控未启动：\n- " + "\n- ".join(self.config_errors)
-            )
+            yield event.plain_result("插件配置无效，后台监控未启动：\n- " + "\n- ".join(self.config_errors))
             return
         try:
             data = self.runtime.status()

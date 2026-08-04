@@ -60,16 +60,9 @@ class ForecastEvaluationStorageTestCase(unittest.TestCase):
         self.assertTrue(self._issue())
         self.assertFalse(self._issue(self.issued_at + timedelta(hours=1)))
         with self.storage.connect() as connection:
-            version = connection.execute(
-                "SELECT value FROM metadata WHERE key='schema_version'"
-            ).fetchone()[0]
-            columns = {
-                row[1]
-                for row in connection.execute("PRAGMA table_info(forecast_issuances)")
-            }
-            count = connection.execute(
-                "SELECT COUNT(*) FROM forecast_issuances"
-            ).fetchone()[0]
+            version = connection.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0]
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(forecast_issuances)")}
+            count = connection.execute("SELECT COUNT(*) FROM forecast_issuances").fetchone()[0]
         self.assertEqual(int(version), EVALUATION_SCHEMA_VERSION)
         self.assertEqual(count, 1)
         self.assertNotIn("recipient", " ".join(columns).casefold())
@@ -85,14 +78,10 @@ class ForecastEvaluationStorageTestCase(unittest.TestCase):
 
     def test_late_pending_prediction_becomes_missed(self):
         self._issue()
-        changed = self.storage.mark_missed(
-            self.issued_at + timedelta(days=9, hours=1)
-        )
+        changed = self.storage.mark_missed(self.issued_at + timedelta(days=9, hours=1))
         self.assertEqual(changed, 1)
         with self.storage.connect() as connection:
-            status = connection.execute(
-                "SELECT status FROM forecast_issuances"
-            ).fetchone()[0]
+            status = connection.execute("SELECT status FROM forecast_issuances").fetchone()[0]
         self.assertEqual(status, "missed")
 
     def test_prune_backup_and_future_version_rejection(self):
@@ -103,18 +92,14 @@ class ForecastEvaluationStorageTestCase(unittest.TestCase):
         self.assertEqual(self.storage.backup(destination), destination)
         connection = sqlite3.connect(destination)
         try:
-            self.assertEqual(
-                connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
-            )
+            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         finally:
             connection.close()
 
         future = Path(self.tmp.name) / "future.db"
         connection = sqlite3.connect(future)
         try:
-            connection.execute(
-                "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT,updated_at TEXT)"
-            )
+            connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT,updated_at TEXT)")
             connection.execute(
                 "INSERT INTO metadata VALUES('schema_version',?,?)",
                 (str(EVALUATION_SCHEMA_VERSION + 1), self.issued_at.isoformat()),
@@ -125,12 +110,35 @@ class ForecastEvaluationStorageTestCase(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ForecastEvaluationStorage(future)
 
+    def test_future_schema_in_wal_is_rejected_without_downgrade(self):
+        future = Path(self.tmp.name) / "future-wal.db"
+        ForecastEvaluationStorage(future)
+        writer = sqlite3.connect(future)
+        try:
+            self.assertEqual(
+                writer.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+                "wal",
+            )
+            writer.execute(
+                "UPDATE metadata SET value=?,updated_at='future-wal' WHERE key='schema_version'",
+                (str(EVALUATION_SCHEMA_VERSION + 1),),
+            )
+            writer.commit()
+
+            with self.assertRaisesRegex(RuntimeError, "newer than supported"):
+                ForecastEvaluationStorage(future)
+
+            self.assertEqual(
+                writer.execute("SELECT value,updated_at FROM metadata WHERE key='schema_version'").fetchone(),
+                (str(EVALUATION_SCHEMA_VERSION + 1), "future-wal"),
+            )
+        finally:
+            writer.close()
+
     def test_feature_json_only_keeps_compact_source_provenance(self):
         self._issue()
         with self.storage.connect() as connection:
-            payload = connection.execute(
-                "SELECT feature_json FROM forecast_issuances"
-            ).fetchone()[0]
+            payload = connection.execute("SELECT feature_json FROM forecast_issuances").fetchone()[0]
         record = json.loads(payload)
         self.assertEqual(record["schema_version"], "forecast_source_digest.v1")
         self.assertEqual(record["source_digest_sha256"], "a" * 64)
@@ -141,9 +149,7 @@ class ForecastEvaluationStorageTestCase(unittest.TestCase):
         recent = datetime.now(timezone.utc) - timedelta(days=8)
         self._issue(recent)
         self.assertEqual(
-            self.storage.resolve(
-                snapshot(recent + timedelta(days=7)), stale=False
-            ),
+            self.storage.resolve(snapshot(recent + timedelta(days=7)), stale=False),
             1,
         )
 

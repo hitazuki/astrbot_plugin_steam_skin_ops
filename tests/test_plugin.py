@@ -67,6 +67,7 @@ def _command_decorator(*_args, **_kwargs):
         func.command = lambda *_a, **_k: _command_decorator()
         func.group = lambda *_a, **_k: _command_decorator()
         return func
+
     return decorate
 
 
@@ -99,15 +100,17 @@ def load_plugin(data_path: Path):
     star.Context = FakeContext
     star.Star = Star
     paths.get_astrbot_plugin_data_path = lambda: str(data_path)
-    sys.modules.update({
-        "astrbot": astrbot,
-        "astrbot.api": api,
-        "astrbot.api.event": event,
-        "astrbot.api.star": star,
-        "astrbot.core": core,
-        "astrbot.core.utils": utils,
-        "astrbot.core.utils.astrbot_path": paths,
-    })
+    sys.modules.update(
+        {
+            "astrbot": astrbot,
+            "astrbot.api": api,
+            "astrbot.api.event": event,
+            "astrbot.api.star": star,
+            "astrbot.core": core,
+            "astrbot.core.utils": utils,
+            "astrbot.core.utils.astrbot_path": paths,
+        }
+    )
     package = types.ModuleType("astrbot_plugin_steam_skin_ops")
     package.__path__ = [str(ROOT)]
     sys.modules[package.__name__] = package
@@ -181,17 +184,13 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(plugin.manager)
             self.assertFalse(plugin.runtime.status()["running"])
             self.assertTrue((Path(tmp) / module.PLUGIN_NAME / "monitor.db").exists())
-            self.assertTrue(
-                (Path(tmp) / module.PLUGIN_NAME / "forecast_evaluation.db").exists()
-            )
+            self.assertTrue((Path(tmp) / module.PLUGIN_NAME / "forecast_evaluation.db").exists())
             await plugin.terminate()
 
     async def test_invalid_config_is_reported_by_status(self):
         with TemporaryDirectory() as tmp:
             module = load_plugin(Path(tmp))
-            plugin = module.SteamSkinOpsPlugin(
-                FakeContext(), {"enabled": True, "max_workers": 99}
-            )
+            plugin = module.SteamSkinOpsPlugin(FakeContext(), {"enabled": True, "max_workers": 99})
             results = [value async for value in plugin.service_status(FakeEvent())]
             self.assertIn("配置无效", results[0])
             self.assertIn("max_workers", results[0])
@@ -207,9 +206,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
             text = await plugin._ai_text(
                 FakeEvent(),
                 task="quote_explanation",
-                candidates=[
-                    {"identity": {"smis_id": 1579}, "model_output": {"p50": 10}}
-                ],
+                candidates=[{"identity": {"smis_id": 1579}, "model_output": {"p50": 10}}],
             )
 
             self.assertIn("AI 双轨分析", text)
@@ -277,13 +274,15 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmp:
             module = load_plugin(Path(tmp))
             plugin = module.SteamSkinOpsPlugin(FakeContext(), {"enabled": False})
-            plugin.manager.storage.upsert_item({
-                "smis_id": 1579,
-                "item_key": "smis:1579",
-                "appid": 730,
-                "name": "Fracture Case",
-                "name_zh": "裂空武器箱",
-            })
+            plugin.manager.storage.upsert_item(
+                {
+                    "smis_id": 1579,
+                    "item_key": "smis:1579",
+                    "appid": 730,
+                    "name": "Fracture Case",
+                    "name_zh": "裂空武器箱",
+                }
+            )
             rule = plugin.manager.storage.add_rule(
                 1579,
                 FakeEvent.unified_msg_origin,
@@ -307,8 +306,22 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
     def test_command_contract_and_admin_permissions_are_present(self):
         source = (ROOT / "main.py").read_text(encoding="utf-8")
         for command in (
-            "skin", "search", "quote", "recommend", "items", "ai", "compare", "eval",
-            "rule", "list", "add", "set", "remove", "test", "status", "help",
+            "skin",
+            "search",
+            "quote",
+            "recommend",
+            "items",
+            "ai",
+            "compare",
+            "eval",
+            "rule",
+            "list",
+            "add",
+            "set",
+            "remove",
+            "test",
+            "status",
+            "help",
         ):
             self.assertIn(f'("{command}")', source)
         self.assertGreaterEqual(source.count("PermissionType.ADMIN"), 6)

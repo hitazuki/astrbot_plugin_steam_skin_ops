@@ -20,19 +20,21 @@ def valid_output() -> str:
 
 
 def candidates() -> list[dict]:
-    return [{
-        "identity": {"smis_id": 1579, "name_zh": "裂空武器箱"},
-        "derived_history": {
-            "coverage": 0.9,
-            "daily_series_21d": {
-                "date": [f"2026-07-{day:02d}" for day in range(1, 22)],
-                "steam_net_cny": [float(day) for day in range(1, 22)],
+    return [
+        {
+            "identity": {"smis_id": 1579, "name_zh": "裂空武器箱"},
+            "derived_history": {
+                "coverage": 0.9,
+                "daily_series_21d": {
+                    "date": [f"2026-07-{day:02d}" for day in range(1, 22)],
+                    "steam_net_cny": [float(day) for day in range(1, 22)],
+                },
             },
-        },
-        "observed_market": {"steam_net_cny": 9.8},
-        "model_output": {"forecast": {"p50_steam_net_cny": 10.0}},
-        "deterministic_ranking": {"eligible": False, "score": None},
-    }]
+            "observed_market": {"steam_net_cny": 9.8},
+            "model_output": {"forecast": {"p50_steam_net_cny": 10.0}},
+            "deterministic_ranking": {"eligible": False, "score": None},
+        }
+    ]
 
 
 class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
@@ -60,9 +62,7 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
         captured = {}
 
         async def generate(provider_id, prompt, system_prompt):
-            captured.update(
-                provider_id=provider_id, prompt=prompt, system_prompt=system_prompt
-            )
+            captured.update(provider_id=provider_id, prompt=prompt, system_prompt=system_prompt)
             return valid_output()
 
         service = LlmAnalysisService(enabled=True)
@@ -78,23 +78,14 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["schema_version"], ANALYSIS_SCHEMA_VERSION)
         self.assertFalse(request["response_contract"]["may_override_score"])
         self.assertNotIn("deterministic_ranking", request["candidates"][0])
-        self.assertIn(
-            "daily_series_21d", request["candidates"][0]["derived_history"]
-        )
+        self.assertIn("daily_series_21d", request["candidates"][0]["derived_history"])
         self.assertEqual(
-            len(
-                request["candidates"][0]["derived_history"]
-                ["daily_series_21d"]["date"]
-            ),
+            len(request["candidates"][0]["derived_history"]["daily_series_21d"]["date"]),
             21,
         )
         self.assertNotIn("private-recipient-value", captured["prompt"])
         self.assertIn("独立识别", captured["system_prompt"])
-        self.assertTrue(
-            request["response_contract"][
-                "must_analyze_observations_before_deterministic_results"
-            ]
-        )
+        self.assertTrue(request["response_contract"]["must_analyze_observations_before_deterministic_results"])
         self.assertIn("数据依据：SMIS ID、T+7 P50", result.text)
         self.assertNotIn("【", result.text)
         self.assertNotIn("candidates.0", result.text)
@@ -118,14 +109,9 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
         )
         request = json.loads(captured["prompt"].rsplit("\n", 1)[1])
         self.assertIn("deterministic_ranking", request["candidates"][0])
-        self.assertIn(
-            "daily_series_21d", request["candidates"][0]["derived_history"]
-        )
+        self.assertIn("daily_series_21d", request["candidates"][0]["derived_history"])
         self.assertEqual(
-            len(
-                request["candidates"][0]["derived_history"]
-                ["daily_series_21d"]["date"]
-            ),
+            len(request["candidates"][0]["derived_history"]["daily_series_21d"]["date"]),
             14,
         )
 
@@ -164,8 +150,7 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
             (
                 "独立观察【candidates.0.identity.smis_id】算法对照"
                 "【candidates.0.model_output.forecast.p50_steam_net_cny】",
-                "独立观察【candidates.0.identity.smis_id】算法对照"
-                "【candidates.0.unknown】不确定性",
+                "独立观察【candidates.0.identity.smis_id】算法对照【candidates.0.unknown】不确定性",
                 "独立观察【candidates.0.identity.smis_id】算法对照，不确定性同上。",
             )
         )
@@ -216,7 +201,8 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
                 "**结论：**走势需要谨慎解释。"
                 "【candidates.0.identity.smis_id】\n"
                 "**与算法的差异：**"
-                + "这是较长但应按完整句子裁剪的自然语言依据。" * 80
+                + "这是较长但应按完整句子裁剪的自然语言依据。"
+                * 80
                 + "【candidates.0.model_output.forecast.p50_steam_net_cny】\n"
                 "**后续关注：**模型结果不是未来保证。"
             )

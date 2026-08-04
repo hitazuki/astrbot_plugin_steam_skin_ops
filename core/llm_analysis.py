@@ -48,8 +48,7 @@ TASK_INSTRUCTIONS = {
         "数据质量，不自行生成正式排名或准入结论。"
     ),
     "evaluation_summary": (
-        "解释评估样本量、MAE、方向准确率和区间覆盖率。小样本必须明确提示，不得把"
-        "历史评估描述为未来保证。"
+        "解释评估样本量、MAE、方向准确率和区间覆盖率。小样本必须明确提示，不得把历史评估描述为未来保证。"
     ),
 }
 
@@ -148,11 +147,7 @@ def _leaf_paths(value: Any, prefix: str = "") -> list[str]:
             for path in _leaf_paths(child, f"{prefix}.{key}" if prefix else str(key))
         ]
     if isinstance(value, list):
-        return [
-            path
-            for index, child in enumerate(value)
-            for path in _leaf_paths(child, f"{prefix}.{index}")
-        ]
+        return [path for index, child in enumerate(value) for path in _leaf_paths(child, f"{prefix}.{index}")]
     return [prefix] if prefix else []
 
 
@@ -163,27 +158,33 @@ def _default_citation_paths(request: dict[str, Any]) -> list[str]:
     for index in range(len(candidates)):
         root = f"candidates.{index}"
         if task == "recommendation_explanation":
-            priorities.extend([
-                f"{root}.deterministic_ranking.score",
-                f"{root}.model_output.forecast.balance_ratio_p50",
-                f"{root}.model_output.risk.risk_balance_ratio",
-                f"{root}.observed_market.instant_balance_ratio",
-            ])
+            priorities.extend(
+                [
+                    f"{root}.deterministic_ranking.score",
+                    f"{root}.model_output.forecast.balance_ratio_p50",
+                    f"{root}.model_output.risk.risk_balance_ratio",
+                    f"{root}.observed_market.instant_balance_ratio",
+                ]
+            )
         else:
-            priorities.extend([
-                f"{root}.observed_market.steam_net_cny",
-                f"{root}.derived_history.daily_series_21d.steam_net_cny",
-                f"{root}.model_output.forecast.p50_steam_net_cny",
-                f"{root}.model_output.risk.overall_level",
-                f"{root}.data_quality.forecast_status",
-            ])
+            priorities.extend(
+                [
+                    f"{root}.observed_market.steam_net_cny",
+                    f"{root}.derived_history.daily_series_21d.steam_net_cny",
+                    f"{root}.model_output.forecast.p50_steam_net_cny",
+                    f"{root}.model_output.risk.overall_level",
+                    f"{root}.data_quality.forecast_status",
+                ]
+            )
     if task == "evaluation_summary":
-        priorities.extend([
-            "evaluation_summary.issued_count",
-            "evaluation_summary.groups.0.mae_pct",
-            "evaluation_summary.groups.0.direction_accuracy",
-            "evaluation_summary.groups.0.interval_coverage",
-        ])
+        priorities.extend(
+            [
+                "evaluation_summary.issued_count",
+                "evaluation_summary.groups.0.mae_pct",
+                "evaluation_summary.groups.0.direction_accuracy",
+                "evaluation_summary.groups.0.interval_coverage",
+            ]
+        )
     leaves = set(_leaf_paths(request))
     available = _field_paths(request)
     selected = [path for path in priorities if path in available]
@@ -198,9 +199,7 @@ def _default_citation_paths(request: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(selected))
 
 
-def _compact_candidate(
-    candidate: dict[str, Any], *, include_ranking: bool, history_days: int
-) -> dict[str, Any]:
+def _compact_candidate(candidate: dict[str, Any], *, include_ranking: bool, history_days: int) -> dict[str, Any]:
     """Expose observations and deterministic output without persisting a new view."""
     compact = copy.deepcopy(candidate)
     history = compact.get("derived_history")
@@ -208,9 +207,7 @@ def _compact_candidate(
         series = history.get("daily_series_21d")
         if isinstance(series, dict):
             history["daily_series_21d"] = {
-                key: list(values)[-history_days:]
-                for key, values in series.items()
-                if isinstance(values, list)
+                key: list(values)[-history_days:] for key, values in series.items() if isinstance(values, list)
             }
     if not include_ranking:
         compact.pop("deterministic_ranking", None)
@@ -219,9 +216,7 @@ def _compact_candidate(
     return compact
 
 
-def _candidate_views(
-    task: str, candidates: list[dict[str, Any]] | None
-) -> list[dict[str, Any]]:
+def _candidate_views(task: str, candidates: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     include_ranking = task == "recommendation_explanation"
     history_days = 14 if include_ranking else 21
     return [
@@ -276,14 +271,8 @@ def _clip_sections(text: str, limit: int) -> str:
     available = max(90, limit - overhead)
     conclusion = _clip_complete(matched.group(1), int(available * 0.25))
     evidence = _clip_complete(matched.group(2), int(available * 0.50))
-    uncertainty = _clip_complete(
-        matched.group(3), available - len(conclusion) - len(evidence)
-    )
-    return (
-        f"结论：{conclusion}\n"
-        f"与算法的差异：{evidence}\n"
-        f"后续关注：{uncertainty}"
-    )
+    uncertainty = _clip_complete(matched.group(3), available - len(conclusion) - len(evidence))
+    return f"结论：{conclusion}\n与算法的差异：{evidence}\n后续关注：{uncertainty}"
 
 
 def _citation_label(path: str, request: dict[str, Any]) -> str:
@@ -341,20 +330,14 @@ def _citation_label(path: str, request: dict[str, Any]) -> str:
     return CITATION_LABELS.get(path, "数据依据")
 
 
-def _render_citations(
-    text: str, request: dict[str, Any]
-) -> tuple[str, str]:
+def _render_citations(text: str, request: dict[str, Any]) -> tuple[str, str]:
     citations = list(dict.fromkeys(CITATION_RE.findall(text)))
     labels = list(dict.fromkeys(_citation_label(path, request) for path in citations))
     body = CITATION_RE.sub("", text)
     body = re.sub(r"【[^】]{0,120}】", "", body)
     body = re.sub(
         r"(?<![\w.])(-?\d+\.\d{3,})(%?)",
-        lambda matched: (
-            f"{float(matched.group(1)):.1f}%"
-            if matched.group(2)
-            else f"{float(matched.group(1)):.2f}"
-        ),
+        lambda matched: f"{float(matched.group(1)):.1f}%" if matched.group(2) else f"{float(matched.group(1)):.2f}",
         body,
     )
     body = re.sub(r"[ \t]+([，。；！？])", r"\1", body)
@@ -399,8 +382,7 @@ class LlmAnalysisService:
         if len(requests) >= self.calls_per_window:
             self._stats["rate_limited"] += 1
             raise LlmRateLimitError(
-                f"当前会话每 {self.window_seconds // 60 or 1} 分钟最多调用 "
-                f"{self.calls_per_window} 次 AI 分析"
+                f"当前会话每 {self.window_seconds // 60 or 1} 分钟最多调用 {self.calls_per_window} 次 AI 分析"
             )
         requests.append(now)
 
@@ -433,13 +415,8 @@ class LlmAnalysisService:
         structured = SECTION_RE.fullmatch(cleaned) is not None
         if not structured:
             prefix = "结论：模型已返回基于市场观察数据的分析。\n与算法的差异：\n"
-            references = "".join(
-                f"【{path}】" for path in list(dict.fromkeys(citations))[:2]
-            )
-            suffix = (
-                "\n后续关注：原始回复未遵循固定章节格式；请以确定性结果为准。"
-                f"参考字段：{references}"
-            )
+            references = "".join(f"【{path}】" for path in list(dict.fromkeys(citations))[:2])
+            suffix = f"\n后续关注：原始回复未遵循固定章节格式；请以确定性结果为准。参考字段：{references}"
             body_limit = max(0, self.max_output_chars - len(prefix) - len(suffix))
             cleaned = prefix + cleaned[:body_limit].rstrip() + suffix
             self._stats["reformatted_outputs"] += 1

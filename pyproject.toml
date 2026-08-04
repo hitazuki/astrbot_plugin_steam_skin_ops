@@ -14,7 +14,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "coverage[toml]>=7.6,<8",
   "jsonschema>=4.23,<5",
+  "mypy>=1.17,<2",
   "PyYAML>=6.0",
   "ruff>=0.12",
   'tomli>=2.0.1; python_version < "3.11"',
@@ -29,3 +31,26 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.coverage.run]
+branch = true
+source = ["core"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true
+
+[tool.mypy]
+files = [
+  "core/catalog.py",
+  "core/errors.py",
+  "core/items.py",
+  "core/recommendation_service.py",
+  "core/rule_service.py",
+  "core/sqlite_schema.py",
+]
+check_untyped_defs = true
+follow_imports = "silent"
+warn_redundant_casts = true
+warn_unused_ignores = true

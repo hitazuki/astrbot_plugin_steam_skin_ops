@@ -18,12 +18,7 @@ def parse_rule_state_integer(value: object) -> int | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if (
-        not math.isfinite(number)
-        or number < 0
-        or number > MAX_RULE_STATE_INTEGER
-        or not number.is_integer()
-    ):
+    if not math.isfinite(number) or number < 0 or number > MAX_RULE_STATE_INTEGER or not number.is_integer():
         return None
     return int(number)
 
@@ -61,11 +56,7 @@ class RuleDefinition:
     def breakthrough(self, value: float, limit: float, step: float) -> tuple[int, float]:
         if not math.isfinite(step) or step <= 0:
             raise ValueError("突破档位步长无效")
-        depth = (
-            (value - limit) / limit
-            if self.direction == "at_or_above"
-            else (limit - value) / limit
-        )
+        depth = (value - limit) / limit if self.direction == "at_or_above" else (limit - value) / limit
         depth = max(0.0, depth)
         if not math.isfinite(depth):
             raise ValueError("突破幅度无效")
@@ -83,19 +74,37 @@ class RuleDefinition:
 
 RULE_DEFINITIONS: dict[str, RuleDefinition] = {
     "ratio": RuleDefinition(
-        "ratio", "即时比例", "即时比例", "即时比例", "【即时挂刀】",
-        "at_or_below", percentage=True,
+        "ratio",
+        "即时比例",
+        "即时比例",
+        "即时比例",
+        "【即时挂刀】",
+        "at_or_below",
+        percentage=True,
     ),
     "t7": RuleDefinition(
-        "t7", "T+7预测比例", "七日预测比例", "T+7 预测比例",
-        "【T+7预测挂刀】", "at_or_below", percentage=True,
+        "t7",
+        "T+7预测比例",
+        "七日预测比例",
+        "T+7 预测比例",
+        "【T+7预测挂刀】",
+        "at_or_below",
+        percentage=True,
     ),
     "platform": RuleDefinition(
-        "platform", "平台买入价", "最低平台价", "平台价", "【平台到价】",
+        "platform",
+        "平台买入价",
+        "最低平台价",
+        "平台价",
+        "【平台到价】",
         "at_or_below",
     ),
     "steam": RuleDefinition(
-        "steam", "Steam清仓价", "Steam 售价", "Steam 价", "【Steam清仓】",
+        "steam",
+        "Steam清仓价",
+        "Steam 售价",
+        "Steam 价",
+        "【Steam清仓】",
         "at_or_above",
     ),
 }
@@ -143,7 +152,9 @@ def validate_rule(rule_type: str, threshold: float) -> tuple[str, str] | None:
 
 
 def measure_rule(
-    snapshot: MarketSnapshot, forecast: dict, rule_type: str,
+    snapshot: MarketSnapshot,
+    forecast: dict,
+    rule_type: str,
 ) -> RuleMeasurement:
     definition = get_rule_definition(rule_type)
     if definition is None:
@@ -186,12 +197,3 @@ def measure_rule(
         reason = (forecast.get("reasons") or ["历史或当前行情不足"])[0]
         return RuleMeasurement(None, finite_predicted, f"七日预测不可用：{reason}")
     return RuleMeasurement(finite_ratio, finite_predicted, "ready")
-
-
-def rule_value(
-    snapshot: MarketSnapshot, forecast: dict, rule_type: str,
-) -> tuple[float | None, float | None, str]:
-    """Compatibility tuple for existing callers; new code should use measure_rule."""
-
-    measurement = measure_rule(snapshot, forecast, rule_type)
-    return measurement.value, measurement.baseline, measurement.status
