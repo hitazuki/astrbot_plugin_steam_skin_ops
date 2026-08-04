@@ -12,10 +12,10 @@ from core.llm_analysis import (
 
 def valid_output() -> str:
     return (
-        "独立观察：候选 A 的市场数据可供独立分析。【candidates.0.identity.smis_id】\n"
-        "算法对照：P50 来自既有模型输出。"
+        "结论：候选 A 的市场数据可供独立分析。【candidates.0.identity.smis_id】\n"
+        "与算法的差异：整体判断与现有算法一致。"
         "【candidates.0.model_output.forecast.p50_steam_net_cny】\n"
-        "不确定性：样本质量仍需关注。"
+        "后续关注：继续观察成交量和库存变化。"
     )
 
 
@@ -95,8 +95,8 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
                 "must_analyze_observations_before_deterministic_results"
             ]
         )
-        self.assertIn("【SMIS ID】", result.text)
-        self.assertIn("【T+7 P50】", result.text)
+        self.assertIn("数据依据：SMIS ID、T+7 P50", result.text)
+        self.assertNotIn("【", result.text)
         self.assertNotIn("candidates.0", result.text)
         self.assertFalse(result.cached)
 
@@ -182,7 +182,7 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
             evaluation_summary=None,
             generate=generate,
         )
-        self.assertIn("不确定性：原始回复未遵循固定章节格式", repaired.text)
+        self.assertIn("后续关注：原始回复未遵循固定章节格式", repaired.text)
         self.assertEqual(service.status("session-a")["stats"]["reformatted_outputs"], 1)
         corrected = await service.analyze(
             umo="session-a",
@@ -193,7 +193,8 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
             generate=generate,
         )
         self.assertNotIn("unknown", corrected.text)
-        self.assertIn("【当前 Steam 到手价】", corrected.text)
+        self.assertIn("数据依据：SMIS ID、当前 Steam 到手价", corrected.text)
+        self.assertNotIn("【", corrected.text)
         injected = await service.analyze(
             umo="session-a",
             provider_id="provider-a",
@@ -202,7 +203,8 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
             evaluation_summary=None,
             generate=generate,
         )
-        self.assertIn("【当前 Steam 到手价】", injected.text)
+        self.assertIn("当前 Steam 到手价", injected.text)
+        self.assertNotIn("【", injected.text)
         stats = service.status("session-a")["stats"]
         self.assertEqual(stats["invalid_outputs"], 0)
         self.assertEqual(stats["injected_citations"], 2)
@@ -211,12 +213,12 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_long_markdown_response_preserves_three_complete_sections(self):
         async def generate(*_args):
             return (
-                "**独立观察：**走势需要谨慎解释。"
+                "**结论：**走势需要谨慎解释。"
                 "【candidates.0.identity.smis_id】\n"
-                "**算法对照：**"
+                "**与算法的差异：**"
                 + "这是较长但应按完整句子裁剪的自然语言依据。" * 80
                 + "【candidates.0.model_output.forecast.p50_steam_net_cny】\n"
-                "**不确定性：**模型结果不是未来保证。"
+                "**后续关注：**模型结果不是未来保证。"
             )
 
         service = LlmAnalysisService(enabled=True, max_output_chars=500)
@@ -229,10 +231,36 @@ class LlmAnalysisServiceTestCase(unittest.IsolatedAsyncioTestCase):
             generate=generate,
         )
         self.assertLessEqual(len(result.text), 500)
-        self.assertIn("独立观察：", result.text)
-        self.assertIn("算法对照：", result.text)
-        self.assertIn("不确定性：模型结果不是未来保证。", result.text)
+        self.assertIn("结论：", result.text)
+        self.assertIn("与算法的差异：", result.text)
+        self.assertIn("后续关注：模型结果不是未来保证。", result.text)
+        self.assertIn("数据依据：", result.text)
+        self.assertNotIn("【", result.text)
         self.assertNotIn("candidates.0", result.text)
+
+    async def test_display_removes_brackets_and_rounds_excess_precision(self):
+        async def generate(*_args):
+            return (
+                "结论：观察价格为 4.9304 元【模型观点】。"
+                "【candidates.0.observed_market.steam_net_cny】\n"
+                "与算法的差异：整体基本一致。"
+                "【candidates.0.model_output.forecast.p50_steam_net_cny】\n"
+                "后续关注：继续观察成交量。"
+            )
+
+        result = await LlmAnalysisService(enabled=True).analyze(
+            umo="session-a",
+            provider_id="provider-a",
+            task="quote_explanation",
+            candidates=candidates(),
+            evaluation_summary=None,
+            generate=generate,
+        )
+
+        self.assertIn("4.93 元", result.text)
+        self.assertNotIn("4.9304", result.text)
+        self.assertNotIn("【", result.text)
+        self.assertIn("数据依据：当前 Steam 到手价、T+7 P50", result.text)
 
     async def test_provider_failure_is_not_retried_or_cached(self):
         calls = 0

@@ -121,7 +121,7 @@ class SteamSkinOpsPlugin(Star):
             chat_provider_id=provider_id,
             prompt=prompt,
             system_prompt=system_prompt,
-            max_tokens=1600,
+            max_tokens=900,
             temperature=0.2,
             request_max_retries=1,
         )
