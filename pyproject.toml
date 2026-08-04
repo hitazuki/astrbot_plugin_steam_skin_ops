@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "astrbot-plugin-steam-skin-ops"
-version = "1.1.0"
+version = "1.2.0"
 description = "AstrBot plugin for Steam skin market monitoring"
 requires-python = ">=3.10"
 dependencies = [
